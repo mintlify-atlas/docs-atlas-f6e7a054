@@ -1,0 +1,115 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "FlowKit (data-assets)",
+  "projectDescription": "A self-contained Python ETL library for extracting data from GitHub, SonarQube, ServiceNow, and Jira into PostgreSQL, orchestrated by Apache Airflow.",
+  "theme": "luma",
+  "primaryColor": "#2563EB",
+  "lightColor": "#EFF6FF",
+  "darkColor": "#1E3A8A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "quickstart-dev"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/run-modes",
+              "guides/airflow-integration",
+              "guides/configuration",
+              "guides/monitoring"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/etl-lifecycle",
+              "architecture/parallel-extraction",
+              "architecture/schema-management"
+            ]
+          },
+          {
+            "group": "Extending",
+            "pages": [
+              "extending/overview",
+              "extending/rest-asset",
+              "extending/api-asset",
+              "extending/token-managers",
+              "extending/transforms",
+              "extending/testing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Assets Catalog",
+        "groups": [
+          {
+            "group": "Built-in Assets",
+            "pages": [
+              "assets/overview",
+              "assets/github",
+              "assets/sonarqube",
+              "assets/servicenow",
+              "assets/jira",
+              "assets/transforms"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/run-asset",
+              "api/asset-classes",
+              "api/token-managers",
+              "api/enums"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Single-function entry point: run_asset(name, mode) handles the full ETL lifecycle",
+    "Atomic runs with temp-table-per-run and promotion only on success",
+    "Resumable extraction via checkpoint-based retry without re-fetching",
+    "Parallel extraction: page-parallel and entity-parallel thread pool modes",
+    "Self-managing schemas: auto-create tables, additive column migration",
+    "In-process thread-safe sliding-window rate limiting per source",
+    "Pluggable token management: GitHub App JWT, ServiceNow OAuth2, Jira Basic/PAT, SonarQube static",
+    "RestAsset declarative pattern: define a new asset in ~25 lines with no custom code",
+    "Dry run mode: extract and validate without promoting to main table",
+    "Stale-run takeover: automatic recovery from orphaned runs via heartbeat monitoring",
+    "Airflow-native secrets injection via run_asset(secrets={...})"
+  ],
+  "publicApiSurface": [
+    "run_asset(asset_name, run_mode, secrets, partition_key, **overrides)",
+    "APIAsset (base class for custom REST assets)",
+    "RestAsset (declarative base class for standard REST APIs)",
+    "TransformAsset (base class for Postgres-to-Postgres SQL transforms)",
+    "TokenManager (abstract base class for authentication)",
+    "Column(name, pg_type, nullable, default)",
+    "Index(columns, unique, method, where, include, name)",
+    "LoadStrategy.FULL_REPLACE / UPSERT / APPEND",
+    "ParallelMode.NONE / PAGE_PARALLEL / ENTITY_PARALLEL",
+    "RunMode.FULL / FORWARD / BACKFILL / TRANSFORM",
+    "PaginationConfig(strategy, page_size, cursor_field, total_path)",
+    "RequestSpec(method, url, params, headers, body)",
+    "PaginationState(has_more, cursor, next_offset, next_page, total_pages, total_records)",
+    "RunContext(run_id, mode, asset_name, partition_key, start_date, end_date, params)",
+    "@register decorator"
+  ]
+}

@@ -1,0 +1,80 @@
+---
+title: "Assets catalog"
+description: "All built-in assets organized by data source with table locations and extraction patterns."
+---
+
+An **asset** in FlowKit is a named, registered ETL unit. Each asset knows its data source, target PostgreSQL table, authentication method, pagination strategy, and load behavior. You run an asset with a single function call — FlowKit handles extraction, rate limiting, schema management, and atomic promotion.
+
+```python
+from data_assets import run_asset
+
+result = run_asset("github_repos", run_mode="full")
+# {'run_id': '...', 'rows_extracted': 312, 'rows_loaded': 312, 'duration_seconds': 4.1, 'status': 'success'}
+```
+
+## Sources at a glance
+
+| Source | Assets | Schema | Detail page |
+|--------|-------:|--------|-------------|
+| GitHub | 12 | `raw.*` | [GitHub assets](/assets/github) |
+| SonarQube | 3 | `raw.*` | [SonarQube assets](/assets/sonarqube) |
+| ServiceNow | 11 | `raw.*` | [ServiceNow assets](/assets/servicenow) |
+| Jira | 2 | `raw.*` | [Jira assets](/assets/jira) |
+| Transforms | 1 | `mart.*` | [Transform assets](/assets/transforms) |
+
+<Columns cols={2}>
+  <Card title="GitHub" icon="github" href="/assets/github">
+    12 assets — repositories, pull requests, branches, commits, workflows, workflow runs, workflow jobs, members, and runner groups.
+  </Card>
+  <Card title="SonarQube" icon="shield-check" href="/assets/sonarqube">
+    3 assets — projects, issues, and per-project quality measures.
+  </Card>
+  <Card title="ServiceNow" icon="ticket" href="/assets/servicenow">
+    11 assets — ITSM, service catalog, user directory, CMDB, hardware, and reference tables.
+  </Card>
+  <Card title="Jira" icon="trello" href="/assets/jira">
+    2 assets — projects and issues, for both Jira Cloud and Jira Data Center.
+  </Card>
+  <Card title="Transforms" icon="database" href="/assets/transforms">
+    1 asset — Postgres-to-Postgres derived tables in the `mart` schema.
+  </Card>
+</Columns>
+
+## Running an asset
+
+Pass the registered asset name and an optional `run_mode` to `run_asset()`:
+
+```python
+from data_assets import run_asset
+
+# Full extraction — replaces or upserts all data
+run_asset("sonarqube_projects", run_mode="full")
+
+# Forward (incremental) — fetches only data since the last successful run
+run_asset("github_pull_requests", run_mode="forward")
+
+# Backfill — fetches historical data from a specific start date
+run_asset("servicenow_incidents", run_mode="backfill", start_date="2024-01-01")
+
+# Transform — reruns a SQL-based derived table
+run_asset("incident_summary", run_mode="transform")
+```
+
+`run_asset()` returns a dict with `run_id`, `rows_extracted`, `rows_loaded`, `duration_seconds`, and `status`.
+
+## Table locations
+
+API assets land in the **`raw`** schema. Transform assets land in the **`mart`** schema.
+
+```
+raw.github_repos
+raw.github_pull_requests
+raw.sonarqube_issues
+raw.servicenow_incidents
+raw.jira_issues
+...
+
+mart.incident_summary
+```
+
+FlowKit creates tables automatically on the first run and adds new columns as your asset definitions evolve. You never need to run `CREATE TABLE` or `ALTER TABLE` manually.

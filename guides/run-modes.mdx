@@ -1,0 +1,113 @@
+---
+title: "Run modes"
+description: "Understand the four run modes: full, forward, backfill, and transform."
+---
+
+FlowKit supports four run modes that control what date window is fetched, how watermarks are updated, and whether API calls are made at all. Every call to `run_asset()` requires a `run_mode` argument (or uses the asset's `default_run_mode`).
+
+## Mode reference
+
+| Mode | When to use | Typical `load_strategy` |
+|------|-------------|------------------------|
+| `full` | Initial load or periodic full refresh | `full_replace` or `upsert` |
+| `forward` | Incremental — fetch new data since last run | `upsert` |
+| `backfill` | Fill in historical data going further back in time | `upsert` |
+| `transform` | Postgres-to-Postgres SQL transform, no API calls | `full_replace` or `upsert` |
+
+## RunMode.FULL
+
+Fetches the complete dataset from the source. No watermark is consulted; `start_date` and `end_date` are both `None` unless explicitly overridden.
+
+After a successful run, both the `forward_watermark` (set to `max(date_column)`) and the `backward_watermark` (set to `min(date_column)`) are recorded in `data_ops.coverage_tracker`.
+
+Use `full` for:
+- The very first load of a new asset
+- Assets that don't support incremental filtering
+- Periodic full refreshes where re-fetching everything is acceptable
+
+## RunMode.FORWARD
+
+Incremental mode. Uses the stored `forward_watermark` as `start_date` and the current UTC time as `end_date`. On the first run (no watermark exists), `start_date` is `None`, which typically causes the asset to fetch all available history.
+
+After a successful run, only the `forward_watermark` is updated (to `max(date_column)`).
+
+Use `forward` for assets that support a date filter and grow over time — issues, pull requests, incidents, commits. Pair with `load_strategy = "upsert"` so updated records replace older versions.
+
+## RunMode.BACKFILL
+
+Fetches data older than the earliest record already loaded. Uses `None` as `start_date` and the stored `backward_watermark` as `end_date`. After a successful run, the `backward_watermark` is updated to `min(date_column)` in the new batch.
+
+Use `backfill` when you need to extend history further back than the initial `full` run captured, or to recover data that was missed during an outage window.
+
+## RunMode.TRANSFORM
+
+For `TransformAsset` — executes a SQL query against existing Postgres tables and writes the result to a target table. No external API calls are made. `start_date` and `end_date` are both `None` regardless of any existing watermarks.
+
+Before executing, FlowKit checks whether the transform's `source_tables` have been refreshed within the last 24 hours and emits a warning if any are stale.
+
+## Passing run_mode to run_asset()
+
+```python
+from data_assets import run_asset
+
+# Full refresh
+result = run_asset("sonarqube_projects", run_mode="full")
+
+# Incremental
+result = run_asset("jira_issues", run_mode="forward")
+
+# Backfill
+result = run_asset("github_pull_requests", run_mode="backfill")
+
+# Transform
+result = run_asset("incident_summary", run_mode="transform")
+```
+
+`run_asset()` returns a dict with run metrics:
+
+```python
+{
+    "run_id": "...",
+    "asset_name": "jira_issues",
+    "partition_key": "",
+    "rows_extracted": 1240,
+    "rows_loaded": 1240,
+    "duration_seconds": 18.4,
+    "status": "success",
+    "metadata": {...},
+}
+```
+
+## Overriding the date window
+
+Pass `start_date` and `end_date` as keyword arguments to override the automatically computed window for any mode:
+
+```python
+from datetime import datetime, UTC
+
+run_asset(
+    "servicenow_incidents",
+    run_mode="forward",
+    start_date=datetime(2024, 1, 1, tzinfo=UTC),
+    end_date=datetime(2024, 6, 30, tzinfo=UTC),
+)
+```
+
+When both values are provided, the coverage watermark is ignored for computing the window. The watermark is still updated on success.
+
+## Dry run
+
+Pass `dry_run=True` to extract and validate data without promoting it to the target table. The run is recorded in `data_ops.run_history` with status `dry_run`. Watermarks are not updated.
+
+```python
+result = run_asset("sonarqube_issues", run_mode="forward", dry_run=True)
+# result["status"] == "dry_run"
+# result["rows_loaded"] == 0
+```
+
+Dry runs are useful for validating schema changes or testing new assets without affecting production data.
+
+<Tip>
+Set `default_run_mode = RunMode.FORWARD` on any asset that supports incremental extraction. The DAG factory uses `default_run_mode` when generating schedules, so assets default to the cheapest mode automatically.
+Use `full` only on the initial load or on a separate backfill DAG — running `full` on a nightly schedule is expensive for large datasets.
+</Tip>

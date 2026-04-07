@@ -1,0 +1,237 @@
+---
+title: "Airflow integration"
+description: "Deploy FlowKit assets as Airflow DAGs with secrets injection and auto-discovery."
+---
+
+FlowKit assets map cleanly to Airflow DAGs: one asset per DAG, one task per DAG run. This keeps failure isolation clean and gives each asset its own schedule, retry policy, and run history in the Airflow UI.
+
+<Warning>
+Ensure the `data_assets_db` Airflow Connection is configured before deploying any DAG. FlowKit resolves `DATABASE_URL` by checking for this connection first. If it is missing and `DATABASE_URL` is not set as an environment variable, every task will fail on startup.
+
+```bash
+airflow connections add data_assets_db \
+    --conn-type postgres \
+    --conn-host "your-postgres-host" \
+    --conn-login "your-user" \
+    --conn-password "your-password" \
+    --conn-schema "data_assets" \
+    --conn-port 5432
+```
+</Warning>
+
+## Basic DAG pattern
+
+Each asset gets its own DAG with a single `PythonOperator` task that calls `run_asset()`. The `airflow_run_id` kwarg links the FlowKit run record to the Airflow DAG run for cross-referencing in `data_ops.run_history`.
+
+```python
+from datetime import timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+default_args = {
+    "owner": "data-engineering",
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
+    "retry_exponential_backoff": True,
+}
+
+with DAG(
+    dag_id="sonarqube_projects",
+    schedule="0 5 * * *",
+    default_args=default_args,
+    max_active_runs=1,
+    catchup=False,
+    tags=["data_assets", "sonarqube"],
+) as dag:
+    PythonOperator(
+        task_id="run",
+        python_callable=lambda **kwargs: __import__("data_assets").run_asset(
+            "sonarqube_projects",
+            run_mode="full",
+            airflow_run_id=kwargs.get("run_id"),
+        ),
+    )
+```
+
+Set `max_active_runs=1` on every asset DAG. FlowKit uses a database lock per asset to prevent concurrent runs, but allowing Airflow to queue multiple runs wastes scheduler resources.
+
+## DAG factory pattern
+
+For auto-discovery of all registered assets, use the DAG factory. It reads every asset from the registry, assigns a default schedule based on `default_run_mode`, and generates GitHub per-org DAGs automatically.
+
+```python
+# dags/data_assets_all.py
+from example_dags.dag_factory import create_dags
+
+globals().update(create_dags())
+```
+
+You can override schedules for specific assets:
+
+```python
+globals().update(create_dags(
+    schedule_overrides={
+        "servicenow_incidents": "@hourly",
+        "github_repos": "0 4 * * *",
+    }
+))
+```
+
+The factory uses these default schedules by run mode:
+
+| Run mode | Default schedule |
+|----------|-----------------|
+| `full` | `0 5 * * *` (05:00 daily) |
+| `forward` | `@hourly` |
+| `backfill` | `None` (manual trigger) |
+| `transform` | `0 8 * * *` (08:00 daily) |
+
+## Passing secrets from Airflow Connections
+
+<Note>
+In Airflow 3.1+ with KubernetesExecutor, tasks run in ephemeral pods that do not inherit environment variables from the scheduler. Injecting secrets via the `secrets` parameter at execution time — rather than pre-configuring env vars on workers — is the correct approach. Secrets are fetched from Connections at task start, injected into `os.environ` for the duration of the run, and cleaned up immediately after.
+</Note>
+
+Use `BaseHook.get_connection()` inside the callable (not at import time) so secrets are resolved when the task executes, not when the DAG file is parsed:
+
+```python
+from airflow.hooks.base import BaseHook
+from data_assets import run_asset
+
+def run_sonarqube(**kwargs):
+    conn = BaseHook.get_connection("sonarqube")
+    return run_asset(
+        "sonarqube_projects",
+        run_mode="full",
+        secrets={
+            "SONARQUBE_URL": f"https://{conn.host}",
+            "SONARQUBE_TOKEN": conn.password,
+        },
+        airflow_run_id=kwargs.get("run_id"),
+    )
+```
+
+### Airflow Connection setup
+
+Run these commands once to register credentials. With a secret backend (Vault, AWS SSM), Airflow resolves these at runtime and values never touch the metadata database.
+
+```bash
+# SonarQube
+airflow connections add sonarqube \
+    --conn-type generic \
+    --conn-host "sonar.company.com" \
+    --conn-password "squ_your_token"
+
+# GitHub App (multi-org format — see below)
+airflow connections add github_app \
+    --conn-type generic \
+    --conn-login "12345" \
+    --conn-password "$(cat github-app-private-key.pem)" \
+    --conn-extra '{"orgs": [{"org": "my-org", "installation_id": "789"}]}'
+
+# Jira
+airflow connections add jira \
+    --conn-type generic \
+    --conn-host "company.atlassian.net" \
+    --conn-login "user@company.com" \
+    --conn-password "jira-api-token"
+
+# ServiceNow
+airflow connections add servicenow \
+    --conn-type generic \
+    --conn-host "company.service-now.com" \
+    --conn-login "etl_user" \
+    --conn-password "password"
+```
+
+## Multi-org GitHub DAGs
+
+GitHub Apps are installed per organization. Each org has its own `installation_id`, so FlowKit uses `partition_key` to scope locks, watermarks, and checkpoints independently per org while writing to a shared target table.
+
+Store all orgs in a single `github_app` Airflow Connection using the `orgs` extra field:
+
+```json
+{
+  "orgs": [
+    {"org": "org-one", "installation_id": "111"},
+    {"org": "org-two", "installation_id": "222"}
+  ]
+}
+```
+
+Then generate one DAG per org per asset:
+
+```python
+from airflow.hooks.base import BaseHook
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import timedelta
+
+default_args = {
+    "owner": "data-engineering",
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
+}
+
+try:
+    _gh_conn = BaseHook.get_connection("github_app")
+    _gh_orgs = _gh_conn.extra_dejson.get("orgs", [])
+except Exception:
+    _gh_orgs = []
+
+
+def _run_github(asset_name, run_mode, org_config, **kwargs):
+    from data_assets import run_asset
+
+    conn = BaseHook.get_connection("github_app")
+    return run_asset(
+        asset_name=asset_name,
+        run_mode=run_mode,
+        partition_key=org_config["org"],
+        secrets={
+            "GITHUB_APP_ID": conn.login,
+            "GITHUB_PRIVATE_KEY": conn.password,
+            "GITHUB_INSTALLATION_ID": org_config["installation_id"],
+            "GITHUB_ORGS": org_config["org"],
+        },
+        airflow_run_id=kwargs.get("run_id"),
+    )
+
+
+for _org_cfg in _gh_orgs:
+    _slug = _org_cfg["org"].replace("-", "_")
+
+    with DAG(
+        dag_id=f"github_repos_{_slug}",
+        schedule="0 5 * * *",
+        default_args=default_args,
+        max_active_runs=1,
+        catchup=False,
+        tags=["data_assets", "github", _org_cfg["org"]],
+    ) as _dag:
+        PythonOperator(
+            task_id="run",
+            python_callable=_run_github,
+            op_kwargs={
+                "asset_name": "github_repos",
+                "run_mode": "full",
+                "org_config": _org_cfg,
+            },
+        )
+```
+
+The `partition_key` parameter scopes the run lock, watermarks, and checkpoints to `(asset_name, org)`, so `github_repos_org-one` and `github_repos_org-two` can run concurrently without interfering with each other.
+
+## Linking runs to Airflow DAG runs
+
+Pass `airflow_run_id=kwargs["run_id"]` to associate a FlowKit run record with its Airflow DAG run. The value is stored in `data_ops.run_history.airflow_run_id` and can be used to join run metrics back to Airflow's own run table for dashboards.
+
+```python
+def run_jira_issues(**kwargs):
+    from data_assets import run_asset
+    return run_asset(
+        "jira_issues",
+        run_mode="forward",
+        airflow_run_id=kwargs.get("run_id"),  # passed by Airflow context
+    )
+```

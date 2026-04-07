@@ -1,0 +1,183 @@
+---
+title: "Local dev setup"
+description: "Set up a local development environment for contributing to FlowKit."
+---
+
+<Steps>
+  <Step title="Prerequisites">
+    Make sure you have the following tools installed before you begin:
+
+    | Tool | Version | Notes |
+    |------|---------|-------|
+    | Python | 3.11+ | `uv python install 3.11` |
+    | uv | latest | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+    | Docker | 20+ | Required for integration tests only |
+    | PostgreSQL | 14+ | Docker or local install (integration tests only) |
+  </Step>
+
+  <Step title="Clone and install">
+    Clone the repository and set up a virtual environment with all dev dependencies:
+
+    ```bash
+    git clone https://github.com/rajesh-rm/flowkit.git
+    cd flowkit
+    ```
+
+    ```bash
+    # Create virtual environment (downloads Python 3.11 if needed)
+    uv venv .venv --python 3.11
+
+    # Install the package in editable mode with all dev dependencies
+    uv pip install -e ".[dev]"
+    ```
+
+    Activate the environment before running commands:
+
+    ```bash
+    source .venv/bin/activate
+    ```
+
+    <Tip>
+      On corporate networks behind a proxy or an internal PyPI mirror, configure `HTTPS_PROXY`, `UV_INDEX_URL`, and `SSL_CERT_FILE` **before** running `uv`. See the proxy setup section below for the full configuration.
+    </Tip>
+  </Step>
+
+  <Step title="Run unit tests">
+    Unit tests require no database, no network, and no Docker:
+
+    ```bash
+    make test-unit
+    ```
+
+    To run with coverage:
+
+    ```bash
+    make test-cov
+    ```
+  </Step>
+
+  <Step title="Run integration tests">
+    Integration tests use [testcontainers](https://testcontainers.com/) to spin up an ephemeral PostgreSQL instance in Docker. Make sure Docker is running before you start:
+
+    ```bash
+    make test-integration
+    ```
+
+    If you don't have Docker, point the tests at an existing PostgreSQL instance:
+
+    ```bash
+    export DATABASE_URL="postgresql://user:pass@localhost:5432/test_data_assets"
+    .venv/bin/python -m pytest tests/integration/ -v -m integration
+    ```
+  </Step>
+
+  <Step title="Code quality">
+    Run the linter and type checker before committing:
+
+    ```bash
+    # Lint
+    ruff check src/ tests/
+
+    # Auto-fix lint issues
+    ruff check src/ tests/ --fix
+
+    # Type checking
+    mypy src/data_assets/
+    ```
+  </Step>
+</Steps>
+
+## Project layout
+
+```
+flowkit/
+├── src/data_assets/          # Package source (installed editable)
+│   ├── core/                 # Asset classes, enums, types, registry
+│   ├── extract/              # API client, rate limiter, tokens, parallel
+│   ├── load/                 # DDL, temp tables, promotion (loader.py)
+│   ├── checkpoint/           # Locks, checkpoints
+│   ├── observability/        # Logging, run tracking
+│   ├── db/                   # SQLAlchemy engine + ORM models
+│   ├── validation/           # Composable validators
+│   ├── transform/            # SQL transforms
+│   ├── assets/               # Concrete asset definitions
+│   │   ├── sonarqube/
+│   │   ├── servicenow/
+│   │   ├── github/
+│   │   ├── jira/
+│   │   └── transforms/
+│   └── runner.py             # Main orchestrator
+├── tests/
+│   ├── unit/                 # Fast tests, no DB
+│   ├── integration/          # E2E with Postgres + mocked APIs
+│   └── fixtures/             # Sample API responses (JSON)
+├── docs/                     # Documentation
+├── example_dags/             # Airflow DAG examples
+└── pyproject.toml            # Build config + dependencies
+```
+
+## Running a single asset locally
+
+Set credentials as environment variables, then call `run_asset()` directly:
+
+```bash
+export DATABASE_URL="postgresql://user:pass@localhost:5432/data_assets"
+export SONARQUBE_URL="https://sonar.example.com"
+export SONARQUBE_TOKEN="sqa_xxxxx"
+```
+
+```bash
+python -c "from data_assets import run_asset; print(run_asset('sonarqube_projects', 'full'))"
+```
+
+You can also store variables in a `.env` file at the repo root (gitignored) instead of exporting them each session.
+
+## Corporate proxy setup
+
+<Tip>
+  Skip this section if you are on a direct internet connection.
+</Tip>
+
+If your network routes traffic through a corporate proxy or an internal PyPI mirror, configure these **before** running `uv` or `pip`. Add them to your shell profile (`~/.zshrc`, `~/.bashrc`) so they persist across sessions.
+
+**HTTP/HTTPS proxy:**
+
+```bash
+export HTTP_PROXY="http://proxy.corp.example.com:8080"
+export HTTPS_PROXY="http://proxy.corp.example.com:8080"
+export NO_PROXY="localhost,127.0.0.1,.corp.example.com"
+```
+
+**Internal PyPI mirror** (Artifactory / Nexus / DevPI):
+
+```bash
+export UV_INDEX_URL="https://artifactory.corp.example.com/api/pypi/pypi-remote/simple"
+```
+
+**Corporate CA certificates** (proxy with TLS inspection):
+
+```bash
+export SSL_CERT_FILE="/etc/pki/tls/certs/corporate-ca-bundle.pem"
+export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+export UV_NATIVE_TLS=true
+```
+
+## Debugging common issues
+
+<AccordionGroup>
+  <Accordion title="Debugging common issues">
+    | Symptom | Likely cause |
+    |---------|-------------|
+    | Asset not found in registry | Missing `@register` decorator or missing import in `__init__.py` |
+    | `build_request` never called | Entity-parallel assets use `build_entity_request` — no need to implement `build_request` |
+    | API returns errors | `base_url` is empty — make sure the env var is set and read at runtime in `build_request` |
+    | Data missing from table | Column names in `parse_response` DataFrame don't match the `columns` list |
+    | Duplicate rows | Check `primary_key` is set correctly; use the `UPSERT` load strategy |
+    | Lock error on retry | Previous run's lock wasn't released — auto-clears after `stale_heartbeat_minutes` (default 20 min) or `max_run_hours` (default 5 hours). Override these on your asset class for slow APIs. |
+    | `uv pip install` fails with SSL/certificate error | Corporate proxy doing TLS inspection — set `SSL_CERT_FILE` and `UV_NATIVE_TLS=true` |
+    | `uv pip install` fails with timeout/connection refused | Proxy not configured — set `HTTPS_PROXY` |
+    | `pip install` downloads from wrong index | Internal mirror not configured — set `UV_INDEX_URL` or `PIP_INDEX_URL` |
+  </Accordion>
+</AccordionGroup>
+
+For the full testing guide — directory structure, fixtures, patterns, and how to write new tests — see [extending/testing](/extending/testing).

@@ -1,0 +1,92 @@
+---
+title: "Jira assets"
+description: "Extract project and issue data from Jira Cloud or Jira Data Center."
+---
+
+FlowKit supports both Jira Cloud (email + API token) and Jira Data Center (personal access token). The `JiraTokenManager` detects which auth mode to use based on which environment variables are present.
+
+## Authentication
+
+<Info>
+  See [Configuration — Jira](/guides/configuration#jira) for instructions on generating an API token (Cloud) or PAT (Data Center) and adding them to your environment.
+</Info>
+
+<Tabs>
+  <Tab title="Jira Cloud">
+    Jira Cloud uses HTTP Basic Auth with your email address and an API token.
+
+    | Environment variable | Required | Description |
+    |----------------------|----------|-------------|
+    | `JIRA_URL` | Yes | Cloud instance URL (e.g., `https://mycompany.atlassian.net`) |
+    | `JIRA_EMAIL` | Yes | Email address of the Jira account |
+    | `JIRA_API_TOKEN` | Yes | API token generated at id.atlassian.com |
+  </Tab>
+  <Tab title="Jira Data Center">
+    Jira Data Center uses Bearer auth with a personal access token (PAT).
+
+    | Environment variable | Required | Description |
+    |----------------------|----------|-------------|
+    | `JIRA_URL` | Yes | Data Center base URL (e.g., `https://jira.example.com`) |
+    | `JIRA_PAT` | Yes | Personal access token from your Jira profile |
+  </Tab>
+</Tabs>
+
+---
+
+## Assets
+
+| Asset | Table | Load | Parallel | Pagination | API endpoint |
+|-------|-------|------|----------|------------|--------------|
+| `jira_projects` | `raw.jira_projects` | FULL_REPLACE | Sequential | offset (`startAt`, `maxResults`) | `GET /rest/api/3/project/search` |
+| `jira_issues` | `raw.jira_issues` | UPSERT | ENTITY_PARALLEL (3 workers) | offset (`startAt`, `maxResults`) | `GET /rest/api/3/search` |
+
+---
+
+## jira_projects
+
+Fetches all projects from the Jira instance using offset pagination with a page size of 50.
+
+Columns: `id`, `key`, `name`, `project_type_key`, `style`, `is_private`  
+Primary key: `key`
+
+Uses `FULL_REPLACE` because the project list is typically small (tens to hundreds of projects) and full replacement is simpler than tracking additions and deletions. No incremental filtering is needed.
+
+Sequential extraction is appropriate here — project lists are small and parallelism adds no benefit.
+
+```python
+run_asset("jira_projects", run_mode="full")
+```
+
+---
+
+## jira_issues
+
+Fetches issues per project using JQL. The framework loads `key` values from `raw.jira_projects` and dispatches one request stream per project using `ENTITY_PARALLEL` (3 workers). Issues are fetched with offset pagination at 100 per page.
+
+Columns: `id`, `key`, `summary`, `status`, `priority`, `issue_type`, `project_key`, `assignee`, `reporter`, `created`, `updated`, `resolution_date`, `labels`  
+Primary key: `id`  
+Watermark column: `updated`
+
+The `_build_jql()` helper constructs the JQL query dynamically:
+
+```python
+# Forward mode (incremental)
+'project = "PROJ" AND updated >= "2025-06-01T00:00:00" ORDER BY updated ASC'
+
+# Full mode (no date filter)
+'project = "PROJ" ORDER BY updated ASC'
+```
+
+Uses `UPSERT` because in `FORWARD` mode the JQL filter is `updated >= watermark`. An issue updated after the previous run will appear again in the next run — upserting by `id` ensures the row is refreshed rather than duplicated.
+
+```python
+# Run projects first — jira_issues fans out by project key
+run_asset("jira_projects", run_mode="full")
+run_asset("jira_issues", run_mode="forward")
+```
+
+---
+
+## Dependency order
+
+`jira_issues` reads project keys from `raw.jira_projects` at runtime. Run `jira_projects` before `jira_issues` on the first deployment, or whenever projects are added.

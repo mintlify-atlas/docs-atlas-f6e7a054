@@ -1,0 +1,222 @@
+---
+title: "RestAsset (declarative)"
+description: "Define a new REST API asset in ~25 lines with no custom extraction code."
+---
+
+For the 80% of assets that follow a standard REST pattern — fetch JSON, paginate, map fields to columns — **RestAsset eliminates the need to write `build_request()` and `parse_response()` entirely.** You declare the endpoint, pagination, and field mapping as class attributes.
+
+## When to use RestAsset vs APIAsset
+
+| Use RestAsset when... | Use APIAsset instead when... |
+|---|---|
+| Standard GET endpoint returns a JSON records array | You need custom request logic (multi-org iteration, JQL construction) |
+| Pagination is page number, offset, or cursor | Pagination needs keyset or custom sort parameters |
+| Field mapping is straightforward renames | Response parsing needs nested extraction or type conversion |
+| No incremental date filter needed (FULL_REPLACE) | Incremental mode requires sort-by-update or `should_stop()` |
+
+**Example:** `sonarqube_projects` uses RestAsset (simple list endpoint). `sonarqube_issues` uses APIAsset (needs UPDATE_DATE sort and custom JQL).
+
+---
+
+## SonarQube Projects example
+
+This is the complete, real implementation from the codebase:
+
+```python sonarqube/projects.py
+from __future__ import annotations
+
+from data_assets.core.column import Column, Index
+from data_assets.core.enums import LoadStrategy, ParallelMode, RunMode
+from data_assets.core.registry import register
+from data_assets.core.rest_asset import RestAsset
+from data_assets.extract.token_manager import SonarQubeTokenManager
+
+
+@register
+class SonarQubeProjects(RestAsset):
+    """SonarQube projects — full catalog, refreshed each run."""
+
+    name = "sonarqube_projects"
+    source_name = "sonarqube"
+    target_schema = "raw"
+    target_table = "sonarqube_projects"
+
+    # Source config — RestAsset reads base URL from this env var at runtime
+    token_manager_class = SonarQubeTokenManager
+    base_url_env = "SONARQUBE_URL"
+    endpoint = "/api/components/search"
+    rate_limit_per_second = 5.0
+
+    # Response parsing — RestAsset handles this automatically
+    response_path = "components"          # JSON path to the records array
+    pagination = {
+        "strategy": "page_number",        # offset, cursor, or none also supported
+        "page_size": 100,
+        "total_path": "paging.total",     # JSON path to the total count
+        "page_index_path": "paging.pageIndex",
+    }
+
+    # Parallelism + load behavior
+    parallel_mode = ParallelMode.PAGE_PARALLEL
+    max_workers = 3
+    load_strategy = LoadStrategy.FULL_REPLACE
+    default_run_mode = RunMode.FULL
+
+    # Schema — matches /api/components/search response fields
+    columns = [
+        Column("key", "TEXT", nullable=False),
+        Column("name", "TEXT"),
+        Column("qualifier", "TEXT"),
+    ]
+    primary_key = ["key"]
+    indexes = [
+        Index(columns=("name",)),
+    ]
+
+    def build_request(self, context, checkpoint=None):
+        spec = super().build_request(context, checkpoint)
+        # Filter to projects only (TRK = project qualifier in SonarQube)
+        spec.params["qualifiers"] = "TRK"
+        return spec
+```
+
+That's it. RestAsset generates both `build_request()` and `parse_response()` from the class attributes. The `build_request()` override above adds one extra query parameter on top of what RestAsset generates — calling `super().build_request()` to get the standard request, then mutating it.
+
+---
+
+## Attribute reference
+
+| Attribute | Required | Description |
+|---|---|---|
+| `endpoint` | Yes | API path, e.g., `"/api/items"` |
+| `base_url_env` | Yes | Env var name for the base URL, e.g., `"MY_API_URL"`. Read at runtime so the same code works against staging and production. |
+| `response_path` | Yes | Dot-path to the records array in the response JSON, e.g., `"components"` or `"data.items"`. Set to `None` or omit if the response itself is the list. A warning is logged if the response is not a list and no `response_path` is configured. |
+| `pagination` | Yes | Dict with at minimum `{"strategy": "...", "page_size": 100}`. See pagination strategies below. |
+| `field_map` | No | Dict mapping API field names to column names, e.g., `{"api_key": "column_name"}`. Only needed for fields that require renaming. Fields that match the column name directly are mapped automatically. Duplicate column targets are rejected at class definition time with a `ValueError`. |
+| `api_date_param` | No | Query parameter name for incremental date filtering, e.g., `"updated_since"`. When set and `context.start_date` is not None, RestAsset automatically adds this parameter to the request. |
+
+---
+
+## Pagination strategies
+
+Set the `pagination` dict on your class. The `strategy` key controls how RestAsset advances through pages.
+
+<AccordionGroup>
+  <Accordion title="page_number — page index pagination">
+    Use when the API numbers pages starting from 1 (e.g., SonarQube uses `?p=1&ps=100`).
+
+    ```python
+    pagination = {
+        "strategy": "page_number",
+        "page_size": 100,
+        "total_path": "paging.total",       # dot-path to total record count
+        "page_index_path": "paging.pageIndex",  # dot-path to current page index
+    }
+    ```
+
+    Optional parameter name overrides: `page_size_param` (default `"ps"`), `page_number_param` (default `"p"`).
+
+    When `total_path` is set, the framework computes total pages and can use `PAGE_PARALLEL` to fetch them concurrently.
+  </Accordion>
+
+  <Accordion title="offset — row offset pagination">
+    Use when the API uses a start-row offset (e.g., Jira uses `?startAt=0&maxResults=100`).
+
+    ```python
+    pagination = {
+        "strategy": "offset",
+        "page_size": 100,
+    }
+    ```
+
+    Optional parameter name overrides: `limit_param` (default `"limit"`), `offset_param` (default `"offset"`).
+  </Accordion>
+
+  <Accordion title="cursor — cursor-based pagination">
+    Use when the API returns a cursor string for the next page (e.g., Slack, some GraphQL APIs).
+
+    ```python
+    pagination = {
+        "strategy": "cursor",
+        "page_size": 100,
+        "cursor_field": "next_cursor",   # JSON key in the response containing the next cursor
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="none — single-page response">
+    Use when the endpoint returns everything in a single response (e.g., a config endpoint that returns one object).
+
+    ```python
+    pagination = {
+        "strategy": "none",
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Customizing with build_request()
+
+If you need to add extra query parameters beyond what RestAsset generates, call `super().build_request()` to get the standard `RequestSpec`, then mutate it:
+
+```python
+def build_request(self, context, checkpoint=None):
+    spec = super().build_request(context, checkpoint)
+    spec.params["qualifiers"] = "TRK"      # project-only filter
+    spec.params["organization"] = "myorg"  # multi-tenant param
+    return spec
+```
+
+You can also override headers in the same way:
+
+```python
+def build_request(self, context, checkpoint=None):
+    spec = super().build_request(context, checkpoint)
+    spec.headers = {"Accept": "application/json;version=2"}
+    return spec
+```
+
+---
+
+## The @register decorator
+
+Every asset class must have the `@register` decorator directly above the class definition:
+
+```python
+@register
+class SonarQubeProjects(RestAsset):
+    name = "sonarqube_projects"
+    ...
+```
+
+The decorator is a one-liner in `src/data_assets/core/registry.py`:
+
+```python
+_registry: dict[str, type[Asset]] = {}
+
+def register(asset_cls: type[Asset]) -> type[Asset]:
+    name = asset_cls.name
+    _registry[name] = asset_cls
+    return asset_cls
+```
+
+When Python imports the module containing the class definition, it calls `register(SonarQubeProjects)`, which adds it to the global `_registry` dict keyed by `asset_cls.name`. Later, the framework calls `registry.get("sonarqube_projects")` to retrieve it.
+
+Without `@register`, the class exists but the framework cannot find it.
+
+---
+
+## Checklist before testing
+
+- [ ] Token manager class exists in `extract/token_manager.py`
+- [ ] Asset file exists at `assets/<source>/<name>.py`
+- [ ] Asset class has `@register` decorator
+- [ ] `name` is unique across all assets (snake_case, `{source}_{entity}`)
+- [ ] `assets/<source>/__init__.py` imports the asset class
+- [ ] `assets/__init__.py` imports `data_assets.assets.<source>`
+- [ ] Required env vars are documented and set: `<SOURCE>_URL`, `<SOURCE>_TOKEN`
+- [ ] `response_path` points to the correct key in the API response
+- [ ] `pagination.total_path` is set if using `PAGE_PARALLEL`
+- [ ] Column names match API field names (or `field_map` renames are defined)

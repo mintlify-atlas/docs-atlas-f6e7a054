@@ -1,0 +1,440 @@
+---
+title: "Asset classes"
+description: "Base classes for defining custom assets: APIAsset, RestAsset, and TransformAsset."
+---
+
+All assets inherit from `Asset`. The class hierarchy is:
+
+```
+Asset (abstract)
+├── APIAsset (abstract)        ← external HTTP APIs
+│   └── RestAsset              ← declarative REST APIs
+└── TransformAsset (abstract)  ← SQL transforms on existing tables
+```
+
+Define an asset as a Python class, decorate it with `@register`, and `run_asset()` will find it by name.
+
+## Asset
+
+`data_assets.core.asset.Asset`
+
+Abstract base class for all assets. Provides the identity, target, and behavior attributes shared by every asset type. Subclasses must set `name` and `columns` at minimum.
+
+### Class attributes
+
+#### Identity
+
+<ParamField path="name" type="str" required>
+  Globally unique identifier for this asset. Used to look it up in the registry via `run_asset("name")`. Must be unique across all registered assets.
+</ParamField>
+
+<ParamField path="description" type="str" default='""'>
+  Human-readable description. Stored in the asset registry table for observability.
+</ParamField>
+
+#### Target table
+
+<ParamField path="target_schema" type="str" default='"raw"'>
+  Postgres schema where the target table lives. Typically `"raw"` for extracted data or `"mart"` for transformed views.
+</ParamField>
+
+<ParamField path="target_table" type="str" default='""'>
+  Postgres table name. Should be set on every asset.
+</ParamField>
+
+<ParamField path="columns" type="list[Column]" default="[]">
+  Table schema definition. Each entry is a `Column` instance describing name, Postgres type, nullability, and optional default. See [Column](#column) below.
+</ParamField>
+
+<ParamField path="primary_key" type="list[str]" default="[]">
+  Column names that form the primary key. Used for UPSERT deduplication and for the default null-check in `validate()`.
+</ParamField>
+
+<ParamField path="indexes" type="list[Index]" default="[]">
+  Index definitions for the target table. At least one index is required; discovery will raise `ValueError` if an asset has none. See [Index](#index) below.
+</ParamField>
+
+#### Behavior
+
+<ParamField path="load_strategy" type="LoadStrategy" default="LoadStrategy.FULL_REPLACE">
+  How data is written to the target table on promotion. See [LoadStrategy](/api/enums#loadstrategy).
+</ParamField>
+
+<ParamField path="default_run_mode" type="RunMode" default="RunMode.FULL">
+  Run mode used when no `run_mode` is passed to `run_asset()`. See [RunMode](/api/enums#runmode).
+</ParamField>
+
+<ParamField path="schema_contract" type="SchemaContract" default="SchemaContract.EVOLVE">
+  How unexpected columns in extracted data are handled during promotion. See [SchemaContract](/api/enums#schemacontract).
+</ParamField>
+
+#### Run resilience
+
+<ParamField path="stale_heartbeat_minutes" type="int" default="20">
+  Minutes of heartbeat silence before a run is considered abandoned. A subsequent run will take over and reuse the abandoned run's temp table.
+</ParamField>
+
+<ParamField path="max_run_hours" type="int" default="5">
+  Maximum hours a run may be active before it is considered abandoned, regardless of heartbeat activity.
+</ParamField>
+
+#### Incremental support
+
+<ParamField path="date_column" type="str | None" default="None">
+  Column used to track forward and backward coverage watermarks. When set, the runner updates the watermark after each successful run so that `"forward"` and `"backfill"` run modes know where to resume.
+</ParamField>
+
+### Methods to override
+
+```python
+def extract(
+    self, engine: Engine, temp_table: str, context: RunContext
+) -> int | None:
+    """Custom extraction hook. Return row count, or None to use the default pipeline."""
+
+def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    """Post-extraction pandas transform. Return the modified DataFrame."""
+
+def validate(self, df: pd.DataFrame, context: RunContext) -> ValidationResult:
+    """Blocking validation before promotion. Raise or return failures to abort the run."""
+
+def validate_warnings(self, df: pd.DataFrame, context: RunContext) -> list[str]:
+    """Non-blocking checks. Warnings are logged but do not prevent promotion."""
+```
+
+The default `validate()` checks that row count is greater than 0 and that all `primary_key` columns contain no nulls. Call `super().validate(df, context)` to keep these defaults when overriding.
+
+---
+
+## APIAsset
+
+`data_assets.core.api_asset.APIAsset`
+
+Extends `Asset` for assets extracted from external HTTP APIs. Handles rate limiting, retries, pagination, parallel extraction, and checkpointing. Subclasses must implement `parse_response()`.
+
+**Defaults changed from `Asset`:**
+
+| Attribute | APIAsset default |
+|---|---|
+| `default_run_mode` | `RunMode.FORWARD` |
+| `load_strategy` | `LoadStrategy.UPSERT` |
+
+### Additional class attributes
+
+#### Source identity
+
+<ParamField path="source_name" type="str" default='""'>
+  Groups related assets together in the registry (e.g., `"github"`, `"jira"`). Used for filtering and observability.
+</ParamField>
+
+<ParamField path="base_url" type="str" default='""'>
+  Base URL for the API. In practice, leave this empty and read from an environment variable inside `build_request()` (or use `RestAsset.base_url_env` for the declarative pattern).
+</ParamField>
+
+#### Token management
+
+<ParamField path="token_manager_class" type="type[TokenManager] | None" default="None">
+  Token manager class (not an instance). The runner instantiates it at the start of each extraction. Required — the runner raises `ValueError` if this is `None`. See [Token managers](/api/token-managers).
+</ParamField>
+
+#### Rate limiting and HTTP
+
+<ParamField path="rate_limit_per_second" type="float" default="10.0">
+  Maximum API requests per second. Can be overridden per-run via `run_asset(..., rate_limit_per_second=5.0)`.
+</ParamField>
+
+<ParamField path="request_timeout" type="float" default="60.0">
+  HTTP request timeout in seconds.
+</ParamField>
+
+<ParamField path="max_retries" type="int" default="3">
+  Number of retry attempts for transient errors (429, 5xx). Uses exponential backoff.
+</ParamField>
+
+#### Pagination
+
+<ParamField path="pagination_config" type="PaginationConfig" default='PaginationConfig(strategy="none")'>
+  Pagination strategy and parameters. See [PaginationConfig](/api/enums#paginationconfig).
+</ParamField>
+
+#### Parallel extraction
+
+<ParamField path="parallel_mode" type="ParallelMode" default="ParallelMode.NONE">
+  Extraction concurrency strategy. See [ParallelMode](/api/enums#parallelmode).
+</ParamField>
+
+<ParamField path="max_workers" type="int" default="1">
+  Thread pool size for parallel extraction modes.
+</ParamField>
+
+<ParamField path="parent_asset_name" type="str | None" default="None">
+  For `ENTITY_PARALLEL` mode: the name of the registered asset whose primary keys are used as entity keys. For example, a `github_branches` asset might set `parent_asset_name = "github_repos"`.
+</ParamField>
+
+<ParamField path="entity_key_column" type="str | None" default="None">
+  When set, the extraction framework injects the entity key as this column name into the DataFrame after `parse_response()`. Useful when the API response does not include the parent identifier (e.g., a GitHub branches response has no `repo_full_name` field).
+</ParamField>
+
+### Methods to override
+
+```python
+@abstractmethod
+def parse_response(
+    self, response: Any
+) -> tuple[pd.DataFrame, PaginationState]:
+    """Parse an API response dict into a DataFrame and pagination state."""
+
+def build_request(
+    self, context: RunContext, checkpoint: dict | None = None
+) -> RequestSpec:
+    """Build the HTTP request for sequential and page-parallel extraction."""
+
+def build_entity_request(
+    self, entity_key: Any, context: RunContext, checkpoint: dict | None = None
+) -> RequestSpec:
+    """Build the HTTP request for a single entity (ENTITY_PARALLEL mode)."""
+
+def filter_entity_keys(self, keys: list) -> list:
+    """Filter parent entity keys before fan-out. Default: return all."""
+
+def classify_error(self, status_code: int, headers: dict) -> str:
+    """Classify an HTTP error. Returns "retry", "skip", or "fail"."""
+
+def should_stop(self, df: pd.DataFrame, context: RunContext) -> bool:
+    """Return True to stop paginating early (watermark-based cutoff)."""
+```
+
+`parse_response()` is the only method that every `APIAsset` subclass must implement. `build_request()` must also be implemented for sequential and page-parallel assets; entity-parallel assets use `build_entity_request()` instead.
+
+---
+
+## RestAsset
+
+`data_assets.core.rest_asset.RestAsset`
+
+Extends `APIAsset` with a declarative interface for standard REST APIs. Generates `build_request()` and `parse_response()` automatically from class attributes. Use this for APIs that return JSON with a consistent records list and standard pagination.
+
+For complex APIs that require custom request or response logic, subclass `APIAsset` directly.
+
+### Additional class attributes
+
+<ParamField path="endpoint" type="str" default='""'>
+  API path appended to the base URL (e.g., `"/api/projects/search"`).
+</ParamField>
+
+<ParamField path="base_url_env" type="str" default='""'>
+  Environment variable name that holds the API base URL (e.g., `"SONARQUBE_URL"`). Read at request time via `os.environ.get(self.base_url_env, self.base_url)`.
+</ParamField>
+
+<ParamField path="response_path" type="str" default='""'>
+  Dot-separated path to the records list in the response JSON (e.g., `"components"`, `"issues.list"`). Set to `""` or `None` when the response itself is a list (e.g., GitHub endpoints that return arrays directly).
+</ParamField>
+
+<ParamField path="pagination" type="dict | None" default="None">
+  Shorthand for `PaginationConfig`. Supported keys: `strategy`, `page_size`, `total_path`, `cursor_field`, `page_size_param`, `page_number_param`, `limit_param`, `offset_param`, `page_index_path`. Alternatively, set `pagination_config` directly with a `PaginationConfig` instance.
+</ParamField>
+
+<ParamField path="field_map" type="dict[str, str]" default="{}">
+  Maps API field names to column names. Only needed for fields that require renaming; fields with names matching a column are mapped automatically. Example: `{"api_name": "col_name"}`.
+</ParamField>
+
+<ParamField path="api_date_param" type="str | None" default="None">
+  Query parameter name for the date filter, added automatically when `context.start_date` is set on incremental runs (e.g., `"createdAfter"`).
+</ParamField>
+
+### Example
+
+```python
+from data_assets.core.column import Column, Index
+from data_assets.core.rest_asset import RestAsset
+from data_assets.core.registry import register
+from data_assets.extract.token_manager import SonarQubeTokenManager
+
+@register
+class SonarQubeProjects(RestAsset):
+    name = "sonarqube_projects"
+    description = "All SonarQube projects"
+    source_name = "sonarqube"
+    target_table = "sonarqube_projects"
+
+    token_manager_class = SonarQubeTokenManager
+    base_url_env = "SONARQUBE_URL"
+    endpoint = "/api/projects/search"
+    response_path = "components"
+    pagination = {"strategy": "page_number", "page_size": 500, "total_path": "paging.total"}
+
+    columns = [
+        Column("key", "TEXT", nullable=False),
+        Column("name", "TEXT"),
+        Column("qualifier", "TEXT"),
+        Column("visibility", "TEXT"),
+        Column("last_analysis_date", "TIMESTAMPTZ"),
+    ]
+    primary_key = ["key"]
+    indexes = [Index(columns=("key",), unique=True)]
+    field_map = {"lastAnalysisDate": "last_analysis_date"}
+```
+
+---
+
+## TransformAsset
+
+`data_assets.core.transform_asset.TransformAsset`
+
+Extends `Asset` for assets derived from SQL transforms on existing Postgres tables. The runner executes the SQL returned by `query()`, writes the results to a temp table, validates, and promotes.
+
+**Defaults changed from `Asset`:**
+
+| Attribute | TransformAsset default |
+|---|---|
+| `default_run_mode` | `RunMode.TRANSFORM` |
+| `load_strategy` | `LoadStrategy.FULL_REPLACE` |
+| `target_schema` | `"mart"` |
+
+### Additional class attributes
+
+<ParamField path="source_tables" type="list[str]" default="[]">
+  Target table names of the source assets. Used for freshness checks at the start of the run — the runner logs a warning if any source table was last loaded more than 24 hours ago.
+</ParamField>
+
+<ParamField path="query_timeout_seconds" type="int" default="300">
+  Postgres `statement_timeout` applied to the transform query.
+</ParamField>
+
+### Methods to override
+
+```python
+@abstractmethod
+def query(self, context: RunContext) -> str:
+    """Return a SQL SELECT statement producing the output rows.
+
+    Column names in the result set must match this asset's `columns` definition.
+    """
+```
+
+### Example
+
+```python
+from data_assets.core.column import Column, Index
+from data_assets.core.enums import LoadStrategy
+from data_assets.core.registry import register
+from data_assets.core.run_context import RunContext
+from data_assets.core.transform_asset import TransformAsset
+
+@register
+class PullRequestSummary(TransformAsset):
+    name = "pr_summary"
+    description = "Aggregated pull request metrics per repository"
+    target_table = "pr_summary"
+    source_tables = ["github_pull_requests"]
+
+    columns = [
+        Column("repo_full_name", "TEXT", nullable=False),
+        Column("open_prs", "INTEGER"),
+        Column("merged_last_30d", "INTEGER"),
+        Column("avg_merge_hours", "FLOAT"),
+    ]
+    primary_key = ["repo_full_name"]
+    indexes = [Index(columns=("repo_full_name",), unique=True)]
+
+    def query(self, context: RunContext) -> str:
+        return """
+            SELECT
+                repo_full_name,
+                COUNT(*) FILTER (WHERE state = 'open') AS open_prs,
+                COUNT(*) FILTER (
+                    WHERE merged_at >= NOW() - INTERVAL '30 days'
+                ) AS merged_last_30d,
+                AVG(
+                    EXTRACT(EPOCH FROM (merged_at - created_at)) / 3600.0
+                ) FILTER (WHERE merged_at IS NOT NULL) AS avg_merge_hours
+            FROM raw.github_pull_requests
+            GROUP BY repo_full_name
+        """
+```
+
+---
+
+## Column
+
+`data_assets.core.column.Column`
+
+Immutable dataclass describing a single column in an asset's target table.
+
+```python
+@dataclass(frozen=True)
+class Column:
+    name: str
+    pg_type: str
+    nullable: bool = True
+    default: str | None = None
+```
+
+<ParamField path="name" type="str" required>
+  Column name in Postgres.
+</ParamField>
+
+<ParamField path="pg_type" type="str" required>
+  Postgres type string. Common values:
+
+  | Type | Usage |
+  |---|---|
+  | `"TEXT"` | Variable-length strings |
+  | `"INTEGER"` | 32-bit integer |
+  | `"FLOAT"` | Floating-point number |
+  | `"BOOLEAN"` | True/False |
+  | `"TIMESTAMPTZ"` | Timestamp with time zone |
+  | `"JSONB"` | Binary JSON |
+  | `"DATE"` | Calendar date (no time) |
+</ParamField>
+
+<ParamField path="nullable" type="bool" default="True">
+  Whether the column allows `NULL` values.
+</ParamField>
+
+<ParamField path="default" type="str | None" default="None">
+  SQL default expression applied at the database level (e.g., `"now()"`, `"0"`).
+</ParamField>
+
+---
+
+## Index
+
+`data_assets.core.column.Index`
+
+Immutable dataclass describing a database index on an asset's target table. Every asset must declare at least one index.
+
+```python
+@dataclass(frozen=True)
+class Index:
+    columns: tuple[str, ...]
+    unique: bool = False
+    method: IndexMethod = IndexMethod.BTREE
+    where: str | None = None
+    include: tuple[str, ...] | None = None
+    name: str | None = None
+```
+
+<ParamField path="columns" type="tuple[str, ...]" required>
+  Column names included in the index. Order matters for composite indexes.
+</ParamField>
+
+<ParamField path="unique" type="bool" default="False">
+  Whether this is a `UNIQUE` index.
+</ParamField>
+
+<ParamField path="method" type="IndexMethod" default="IndexMethod.BTREE">
+  Index access method. One of `BTREE`, `GIN`, `GIST`, `HASH`, `BRIN`, `SPGIST`.
+</ParamField>
+
+<ParamField path="where" type="str | None" default="None">
+  Partial index `WHERE` clause as raw SQL (omit the `WHERE` keyword). Example: `"state = 'open'"`.
+</ParamField>
+
+<ParamField path="include" type="tuple[str, ...] | None" default="None">
+  Additional columns for a covering index (`INCLUDE` clause).
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Explicit index name. If omitted, a deterministic name is generated as `ix_{table}_{col1}_{col2}[_unique][_partial]`, truncated to 63 characters with a hash suffix if needed.
+</ParamField>

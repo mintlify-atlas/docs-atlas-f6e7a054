@@ -1,0 +1,182 @@
+---
+title: "Transform assets"
+description: "Create Postgres-to-Postgres derived tables using SQL-based TransformAsset."
+---
+
+Transform assets produce derived data from existing Postgres tables. They do not call any external API. Instead, they run a SQL query against the database and write the results to a new table.
+
+## When to use TransformAsset
+
+Use `TransformAsset` when:
+- You already have raw data in Postgres (from API assets) and want to create aggregated, joined, or reshaped views of that data.
+- The transformation can be expressed as a SQL SELECT statement.
+- You need a `mart.` schema table that downstream dashboards or reports query directly.
+
+Do **not** use TransformAsset for anything that needs to call an external API — use [APIAsset](/extending/api-asset) or [RestAsset](/extending/rest-asset) instead.
+
+---
+
+## TransformAsset base class
+
+```python transform_asset.py
+class TransformAsset(Asset):
+    asset_type = AssetType.TRANSFORM
+    default_run_mode = RunMode.TRANSFORM
+    load_strategy = LoadStrategy.FULL_REPLACE
+    target_schema = "mart"        # convention: transforms land in "mart" schema
+
+    source_tables: list[str] = []
+    # Documents which raw tables this transform depends on.
+    # The framework uses this for freshness checks and dependency ordering.
+
+    query_timeout_seconds: int = 300
+    # Sets a per-query statement_timeout on the Postgres session (via SET LOCAL).
+    # Override if your transform legitimately needs more than 5 minutes.
+
+    @abstractmethod
+    def query(self, context: RunContext) -> str:
+        """Return a SQL SELECT producing the output rows.
+
+        The result set column names must match this asset's columns definition.
+        """
+        ...
+```
+
+<Tip>
+Set `default_run_mode = RunMode.TRANSFORM` on your subclass. This is already the default on `TransformAsset`, but setting it explicitly makes the intent clear and enables `run_asset("my_transform")` to work without specifying a mode.
+</Tip>
+
+---
+
+## Source freshness check
+
+If any table in `source_tables` has not been refreshed in over 24 hours, FlowKit logs a warning before running the transform. This catches the common mistake of running a transform before its source data has been updated.
+
+---
+
+## Why FULL_REPLACE for most transforms
+
+Aggregations are always recomputed from the full state of the source tables. There is no concept of "incremental" for a `GROUP BY` query — you must rerun the entire query to get correct totals. `FULL_REPLACE` is almost always the right choice.
+
+---
+
+## Complete example: incident summary
+
+This is the real `IncidentSummary` transform from the codebase, which aggregates ServiceNow incidents by day, priority, and state:
+
+```python transforms/incident_summary.py
+from __future__ import annotations
+
+from data_assets.core.column import Column, Index
+from data_assets.core.enums import LoadStrategy, RunMode
+from data_assets.core.registry import register
+from data_assets.core.run_context import RunContext
+from data_assets.core.transform_asset import TransformAsset
+
+
+@register
+class IncidentSummary(TransformAsset):
+    name = "incident_summary"
+    description = "Daily incident summary aggregated from raw ServiceNow incidents"
+
+    target_schema = "mart"
+    target_table = "incident_summary"
+
+    source_tables = ["servicenow_incidents"]
+    # The framework checks that servicenow_incidents has been refreshed
+    # within the last 24 hours before running this transform.
+
+    default_run_mode = RunMode.TRANSFORM
+    load_strategy = LoadStrategy.FULL_REPLACE
+
+    columns = [
+        Column("report_date", "DATE", nullable=False),
+        Column("priority", "TEXT", nullable=False),
+        Column("state", "TEXT", nullable=False),
+        Column("incident_count", "INTEGER", nullable=False),
+    ]
+    primary_key = ["report_date", "priority", "state"]
+    indexes = [
+        Index(columns=("report_date",)),
+        Index(columns=("priority",)),
+    ]
+
+    def query(self, context: RunContext) -> str:
+        return """
+            SELECT
+                DATE(opened_at)                          AS report_date,
+                COALESCE(priority, 'Unknown')            AS priority,
+                COALESCE(state, 'Unknown')               AS state,
+                COUNT(*)                                 AS incident_count
+            FROM raw.servicenow_incidents
+            WHERE opened_at IS NOT NULL
+            GROUP BY DATE(opened_at), priority, state
+            ORDER BY report_date DESC, priority, state
+        """
+```
+
+The `query()` method returns a plain SQL string. The framework executes it with a `statement_timeout` set to `query_timeout_seconds`, writes the result to a temp table, validates it, and promotes it to `mart.incident_summary`.
+
+---
+
+## The optional transform() hook
+
+After the SQL query runs, the framework calls `transform(df)` on the result DataFrame. The default returns `df` unchanged. Override it for pandas-level post-processing that is hard to express in SQL:
+
+```python
+def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    # Example: add a computed column that SQL can't easily express
+    df["is_high_volume_day"] = df["incident_count"] > df["incident_count"].quantile(0.9)
+    return df
+```
+
+---
+
+## Overriding the query timeout
+
+If your transform runs a heavy multi-table JOIN that legitimately needs more than 5 minutes, override `query_timeout_seconds`:
+
+```python
+class HeavyTransform(TransformAsset):
+    query_timeout_seconds = 900  # 15 minutes
+```
+
+---
+
+## Wiring up a transform
+
+Transforms live in `src/data_assets/assets/transforms/`. Add your new class to the `__init__.py` in that directory:
+
+```python assets/transforms/__init__.py
+from data_assets.assets.transforms.incident_summary import IncidentSummary
+from data_assets.assets.transforms.my_new_transform import MyNewTransform
+```
+
+No other wiring is needed — the `transforms` package is already imported by the top-level `assets/__init__.py`.
+
+---
+
+## Running a transform
+
+```python
+from data_assets import run_asset
+
+# Run a transform asset by name
+run_asset("incident_summary")
+
+# Equivalent — run mode is inferred from default_run_mode
+run_asset("incident_summary", run_mode="transform")
+```
+
+---
+
+## Checklist before testing
+
+- [ ] Class placed in `src/data_assets/assets/transforms/`
+- [ ] `@register` decorator on the class
+- [ ] `source_tables` lists the correct raw table names
+- [ ] `target_schema = "mart"` (convention for derived tables)
+- [ ] SQL `SELECT` column aliases match the `columns` definition exactly
+- [ ] `primary_key` covers the natural grain of the output
+- [ ] At least one `Index` defined
+- [ ] Class imported in `assets/transforms/__init__.py`

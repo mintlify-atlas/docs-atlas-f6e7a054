@@ -1,0 +1,153 @@
+---
+title: "Monitoring & observability"
+description: "Monitor asset runs using Airflow, PostgreSQL metadata tables, and structured logs."
+---
+
+FlowKit writes run metrics to PostgreSQL metadata tables and emits structured logs to stdout. All observability data is available without any external monitoring infrastructure.
+
+## Airflow UI
+
+Each asset is deployed as a separate DAG, tagged by source (e.g., `data_assets`, `sonarqube`, `github`). The Airflow UI shows:
+
+- Run status (success, failed, running) per DAG run
+- Task duration and retry history
+- Task logs captured from stdout
+
+Filter by the `data_assets` tag in the DAG list to see all FlowKit-managed DAGs. GitHub assets are further tagged by org name (e.g., `my-org`), making it easy to isolate failures to a specific organization.
+
+## Run history
+
+Every run — including failures and dry runs — is recorded in `data_ops.run_history`. Query it to audit run metrics, diagnose failures, or build custom dashboards.
+
+```sql
+SELECT
+    run_id,
+    asset_name,
+    partition_key,
+    run_mode,
+    status,
+    rows_extracted,
+    rows_loaded,
+    started_at,
+    completed_at,
+    EXTRACT(EPOCH FROM (completed_at - started_at)) AS duration_seconds,
+    error_message,
+    metadata,
+    airflow_run_id
+FROM data_ops.run_history
+WHERE asset_name = 'jira_issues'
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
+Key columns:
+
+| Column | Description |
+|--------|-------------|
+| `run_id` | UUID identifying the run (UUIDv7, sortable by time) |
+| `asset_name` | Registered asset name |
+| `partition_key` | Org or tenant identifier for partitioned assets; `""` for non-partitioned |
+| `run_mode` | One of `full`, `forward`, `backfill`, `transform` |
+| `status` | `running`, `success`, `failed`, or `dry_run` |
+| `rows_extracted` | Rows written to the temp table before promotion |
+| `rows_loaded` | Rows written to the target table after promotion |
+| `started_at` | UTC timestamp when the run started |
+| `completed_at` | UTC timestamp when the run completed (null if still running) |
+| `error_message` | Error string on failure |
+| `metadata` | JSONB with `extraction_seconds`, `promotion_seconds`, `warnings`, API call stats |
+| `airflow_run_id` | Airflow DAG run ID when passed via `run_asset(..., airflow_run_id=...)` |
+
+## Coverage tracker
+
+`data_ops.coverage_tracker` records watermarks that `forward` and `backfill` modes use to compute their date windows.
+
+```sql
+SELECT
+    asset_name,
+    partition_key,
+    forward_watermark,
+    backward_watermark,
+    updated_at
+FROM data_ops.coverage_tracker
+ORDER BY asset_name, partition_key;
+```
+
+| Column | Description |
+|--------|-------------|
+| `asset_name` | Registered asset name |
+| `partition_key` | Org/tenant scope; `""` for non-partitioned assets |
+| `forward_watermark` | `max(date_column)` from the last `full` or `forward` run. Used as `start_date` for the next `forward` run |
+| `backward_watermark` | `min(date_column)` from the last `full` or `backfill` run. Used as `end_date` for the next `backfill` run |
+| `updated_at` | UTC timestamp of the last watermark update |
+
+A null `forward_watermark` means the asset has never completed a `full` or `forward` run. The next `forward` run will use `start_date=None`, typically fetching all available history.
+
+## Structured logs
+
+FlowKit logs to `stdout` using Python's standard `logging` module. The format is:
+
+```
+2024-03-15T09:12:34 [INFO] data_assets.runner — Starting run: asset=jira_issues mode=forward run_id=018e... dry_run=False
+2024-03-15T09:12:52 [INFO] data_assets.runner — Extraction complete: 1240 rows in 17.3s (48 API calls)
+2024-03-15T09:12:53 [INFO] data_assets.runner — Run complete: asset=jira_issues rows_extracted=1240 rows_loaded=1240 duration=18.4s status=success
+```
+
+Airflow task logs capture stdout automatically, so no additional log shipping is needed. Each log line includes the asset name, run mode, run ID, and key metrics for filtering in log aggregation tools.
+
+## Row count anomaly detection
+
+After extraction, FlowKit compares the current run's `rows_extracted` against the average of the last five successful runs for the same asset and partition. If the count drops below 50% of that average, a warning is emitted:
+
+```
+[WARNING] data_assets.runner — Row count anomaly for 'jira_issues': got 12, recent average is 1240
+```
+
+This detection runs automatically on every run. The threshold is fixed at 50% (`ROW_COUNT_ANOMALY_THRESHOLD = 0.5` in `runner.py`). The warning does not fail the run — it surfaces in task logs and in `run_history.metadata["warnings"]`.
+
+Common causes:
+- Source API returning partial results due to a filter or permission change
+- A backfill run pulling a narrow historical window
+- The first few runs on a new asset (no prior average yet)
+
+## Stale run detection and takeover
+
+FlowKit uses a `data_ops.run_locks` table to prevent concurrent runs of the same asset. Each active run holds a lock and updates a heartbeat timestamp at each checkpoint write. If a worker crashes or stalls:
+
+- **Heartbeat staleness**: if `heartbeat_at` is older than `stale_heartbeat_minutes` (default: 20 minutes), the run is considered abandoned
+- **Wall-time limit**: if `locked_at` is older than `max_run_hours` (default: 5 hours), the run is forced over regardless of heartbeat
+
+When a new run detects a stale lock, it takes over automatically:
+1. The abandoned run is marked `failed` in `run_history` with the message `"Abandoned — taken over by new worker"`
+2. The partial temp table from the abandoned run is inherited (preserving already-extracted data)
+3. The new run continues extraction from the last checkpoint
+
+No manual intervention is required. The takeover is logged:
+
+```
+[INFO] data_assets.runner — Reusing temp table 'temp_store.jira_issues_...' from abandoned run 018d...
+```
+
+## Resetting local state
+
+To fully reset FlowKit metadata and start fresh (development or testing):
+
+```sql
+-- Drop all metadata state
+DROP SCHEMA data_ops CASCADE;
+
+-- Drop extracted data schemas
+DROP SCHEMA raw CASCADE;
+DROP SCHEMA mart CASCADE;
+DROP SCHEMA temp_store CASCADE;
+```
+
+FlowKit recreates all schemas and tables automatically on the next `run_asset()` call. This is equivalent to a clean install — all watermarks, run history, and checkpoints are lost.
+
+To reset only the metadata without dropping extracted data:
+
+```sql
+TRUNCATE data_ops.run_history;
+TRUNCATE data_ops.coverage_tracker;
+TRUNCATE data_ops.checkpoints;
+DELETE FROM data_ops.run_locks;
+```

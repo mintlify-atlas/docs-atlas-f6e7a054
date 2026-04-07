@@ -1,0 +1,169 @@
+---
+title: "Configuration"
+description: "Configure credentials for PostgreSQL and each data source."
+---
+
+FlowKit resolves all credentials through a `CredentialResolver` that checks Airflow Connections, environment variables, and a `.env` file in that order. You only need to configure the sources you use.
+
+## DATABASE\_URL
+
+FlowKit requires a PostgreSQL connection for its metadata tables (`data_ops.run_history`, `data_ops.coverage_tracker`, etc.) and for writing extracted data.
+
+```bash
+export DATABASE_URL="postgresql://user:pass@host:5432/data_assets"
+```
+
+**Resolution order:**
+
+1. Airflow Connection `data_assets_db` (standard Postgres connection type)
+2. `DATABASE_URL` environment variable
+3. `DATABASE_URL` in `.env` file at the repository root
+
+The database and required schemas (`data_ops`, `raw`, `mart`, `temp_store`) are created automatically on first run. The connecting user needs `CREATE SCHEMA` privileges.
+
+## SonarQube
+
+| Variable | Description |
+|----------|-------------|
+| `SONARQUBE_URL` | SonarQube server URL (e.g., `https://sonar.example.com`) |
+| `SONARQUBE_TOKEN` | API token |
+
+**How to get a token:** Log in to SonarQube → click your avatar (top-right) → **My Account** → **Security** tab → **Generate Tokens**. Choose type "User Token", give it a name, and copy the value.
+
+## ServiceNow
+
+ServiceNow assets use [pysnc](https://github.com/ServiceNow/PySNC) (GlideRecord client). Username and password are always required. OAuth2 is optional but recommended for production.
+
+**Required:**
+
+| Variable | Description |
+|----------|-------------|
+| `SERVICENOW_INSTANCE` | Instance URL (e.g., `https://dev12345.service-now.com`) |
+| `SERVICENOW_USERNAME` | Username |
+| `SERVICENOW_PASSWORD` | Password |
+
+**Optional — OAuth2 (recommended for production):**
+
+| Variable | Description |
+|----------|-------------|
+| `SERVICENOW_CLIENT_ID` | OAuth2 client ID |
+| `SERVICENOW_CLIENT_SECRET` | OAuth2 client secret |
+
+When all five credentials are set, FlowKit uses OAuth2 `password` grant flow via `ServiceNowPasswordGrantFlow`. If `CLIENT_ID` or `CLIENT_SECRET` is absent, it falls back to basic authentication with `(username, password)`.
+
+**OAuth2 setup in ServiceNow:** Navigate to **System OAuth > Application Registry** → **Create an OAuth API endpoint for external clients**. Note the Client ID and Client Secret.
+
+## GitHub
+
+GitHub assets use a GitHub App for authentication. App credentials are shared across orgs; the `GITHUB_INSTALLATION_ID` and `GITHUB_ORGS` are per-org.
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_APP_ID` | GitHub App ID |
+| `GITHUB_PRIVATE_KEY` | PEM-encoded private key (full contents including `-----BEGIN RSA PRIVATE KEY-----`) |
+| `GITHUB_INSTALLATION_ID` | Installation ID for the target org |
+| `GITHUB_ORGS` | Comma-separated org names (e.g., `"org1,org2"`) |
+| `GITHUB_API_URL` | Optional — API URL override. Defaults to `https://api.github.com` |
+
+**GitHub App setup:**
+
+<Steps>
+  <Step title="Create the app">
+    Go to **Settings > Developer settings > GitHub Apps > New GitHub App**. Set permissions: Repository (read), Pull requests (read), Actions (read).
+  </Step>
+  <Step title="Note the App ID">
+    After creating the app, the **App ID** is shown on the app's settings page.
+  </Step>
+  <Step title="Generate a private key">
+    On the app settings page, click **Generate a private key**. A PEM file downloads — store it securely. Set `GITHUB_PRIVATE_KEY` to the full file contents.
+  </Step>
+  <Step title="Install the app on your org">
+    From the app settings page, click **Install App** and choose your org(s). After installing, the URL contains the Installation ID: `/installations/{id}`. Set `GITHUB_INSTALLATION_ID` to that value.
+  </Step>
+</Steps>
+
+For multi-org setups, see [Airflow integration — multi-org GitHub DAGs](/guides/airflow-integration#multi-org-github-dags).
+
+## Jira
+
+<Tabs>
+  <Tab title="Cloud">
+    Jira Cloud authenticates with an email address and an API token.
+
+    | Variable | Description |
+    |----------|-------------|
+    | `JIRA_URL` | Jira Cloud URL (e.g., `https://mysite.atlassian.net`) |
+    | `JIRA_EMAIL` | User email address |
+    | `JIRA_API_TOKEN` | API token |
+
+    **How to get an API token:** Log in to [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) → **Create API token**. Use your email as `JIRA_EMAIL` and the generated token as `JIRA_API_TOKEN`.
+  </Tab>
+  <Tab title="Data Center">
+    Jira Data Center authenticates with a Personal Access Token (PAT).
+
+    | Variable | Description |
+    |----------|-------------|
+    | `JIRA_URL` | Jira Data Center URL (e.g., `https://jira.company.internal`) |
+    | `JIRA_PAT` | Personal access token |
+
+    **How to get a PAT:** Log in to Jira → click your avatar → **Profile** → **Personal Access Tokens** → **Create token**.
+  </Tab>
+</Tabs>
+
+## Runtime overrides
+
+Pass overrides as keyword arguments to `run_asset()` to adjust behavior for a specific run without changing the asset definition:
+
+```python
+from data_assets import run_asset
+
+run_asset(
+    "sonarqube_issues",
+    run_mode="forward",
+    rate_limit_per_second=2.0,   # Throttle API calls during business hours
+    max_workers=2,                # Reduce concurrency
+    start_date=some_datetime,     # Override computed date window start
+    end_date=some_datetime,       # Override computed date window end
+)
+```
+
+| Override | Type | Description |
+|----------|------|-------------|
+| `rate_limit_per_second` | `float` | Maximum API requests per second |
+| `max_workers` | `int` | Number of parallel extraction workers |
+| `request_timeout` | `float` | HTTP request timeout in seconds |
+| `max_retries` | `int` | Number of retry attempts on transient errors |
+| `start_date` | `datetime` | Override window start (UTC-aware) |
+| `end_date` | `datetime` | Override window end (UTC-aware) |
+| `dry_run` | `bool` | Extract and validate but skip promotion to target table |
+| `airflow_run_id` | `str` | Links run to an Airflow DAG run in run history |
+
+## Network and proxy
+
+If your environment routes traffic through a corporate proxy, set these variables so that `httpx` (used for API extraction) and `pysnc` (ServiceNow) can reach external APIs.
+
+| Variable | Description |
+|----------|-------------|
+| `HTTPS_PROXY` | Proxy URL for HTTPS traffic (e.g., `http://proxy.corp.example.com:8080`) |
+| `HTTP_PROXY` | Proxy URL for HTTP traffic |
+| `NO_PROXY` | Comma-separated hostnames/domains to bypass the proxy (e.g., `localhost,127.0.0.1,.corp.example.com`) |
+| `SSL_CERT_FILE` | Path to custom CA bundle for TLS inspection |
+| `REQUESTS_CA_BUNDLE` | Same as `SSL_CERT_FILE` — used by `requests` and `httpx` |
+
+`httpx` respects `HTTPS_PROXY` and `SSL_CERT_FILE` natively. If your corporate proxy CA is already in the system trust store, no extra configuration is needed.
+
+## .env file support
+
+FlowKit uses [python-dotenv](https://pypi.org/project/python-dotenv/) to load a `.env` file from the repository root during local development. Create a `.env` file and set variables there to avoid exporting them manually each session:
+
+```bash
+# .env
+DATABASE_URL=postgresql://user:pass@localhost:5432/data_assets
+SONARQUBE_URL=https://sonar.example.com
+SONARQUBE_TOKEN=sqa_xxxxx
+JIRA_URL=https://mysite.atlassian.net
+JIRA_EMAIL=user@example.com
+JIRA_API_TOKEN=your_token
+```
+
+The `.env` file is the lowest-priority source. Values set in the environment or via Airflow Connections always take precedence.

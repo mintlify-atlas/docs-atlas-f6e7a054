@@ -1,0 +1,81 @@
+---
+title: "Architecture overview"
+description: "How FlowKit's layered design separates orchestration, extraction, loading, and observability."
+---
+
+## Core principle
+
+Airflow knows **when** and **whether** to run. FlowKit knows **how**.
+
+Apache Airflow is responsible for scheduling, retry policy, and dependency management. FlowKit is responsible for the full ETL lifecycle: locking, extraction, checkpointing, schema management, validation, atomic promotion, and observability. Airflow calls one function and gets back a result dict.
+
+## Single entry point
+
+Every ETL run starts with a single function call:
+
+```python
+from data_assets import run_asset
+
+result = run_asset("sonarqube_projects", run_mode="full")
+```
+
+`run_asset(name, mode)` orchestrates the complete lifecycle — from acquiring a run lock to releasing it — in one call. Nothing else is required.
+
+## Layered architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        runner.py                                 │
+│  run_asset() — orchestrates the full lifecycle                   │
+├─────────┬──────────┬───────────┬──────────┬────────────────────┤
+│ extract/│  load/   │checkpoint/│transform/│   observability/   │
+│         │          │           │          │                     │
+│ API     │ loader:  │ locks     │ SQL      │ logging            │
+│ client  │  DDL     │ checkpts  │ transforms│ run_tracker       │
+│ rate    │  temp    │           │          │                     │
+│ limiter │  promote │           │          │                     │
+│ tokens  │          │           │          │                     │
+│ parallel│          │           │          │                     │
+├─────────┴──────────┴───────────┴──────────┴────────────────────┤
+│                     core/ + db/                                  │
+│  Asset classes, enums, types, registry, SQLAlchemy models        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Layer descriptions
+
+| Layer | Files | Responsibility |
+|-------|-------|----------------|
+| **runner** | `runner.py` | Top-level orchestrator. Implements the five-phase run lifecycle, branches on asset type (API, transform, custom extract), and handles failure cleanup. |
+| **extract** | `extract/api_client.py`, `extract/parallel.py`, `extract/rate_limiter.py`, `extract/token_manager.py` | HTTP client with retry and error classification, three parallel extraction modes, thread-safe sliding-window rate limiter, and token refresh management. |
+| **load** | `load/loader.py` | DDL (create tables, add columns), temp table lifecycle (create UNLOGGED, write, read, drop), and promotion (FULL_REPLACE / UPSERT / APPEND) in a single transaction. |
+| **checkpoint** | `checkpoint/manager.py` | Run locks, stale-run takeover detection, per-worker checkpoint persistence, and heartbeat refresh. |
+| **transform** | `transform/db_transform.py` | Executes SQL transforms for `TransformAsset` types with a configurable `statement_timeout`. |
+| **observability** | `observability/logging.py`, `observability/run_tracker.py` | Structured logging setup, run history recording, coverage watermark updates, and source freshness checks. |
+| **core + db** | `core/`, `db/` | Asset base classes (`Asset`, `APIAsset`, `TransformAsset`, `RestAsset`), enums (`LoadStrategy`, `SchemaContract`, `ParallelMode`), column and index definitions, asset registry, run context, and SQLAlchemy ORM models. |
+
+## Postgres schema layout
+
+FlowKit uses four dedicated PostgreSQL schemas. Each schema has a distinct purpose and access pattern.
+
+| Schema | Purpose |
+|--------|---------|
+| `raw` | Default landing zone for API-sourced assets. Tables are owned by FlowKit and populated on each run. |
+| `mart` | Transformed and derived assets. Populated by `TransformAsset` runs that read from `raw` tables. |
+| `temp_store` | UNLOGGED temporary tables — one per active run. Created at run start, dropped after successful promotion (or on failure cleanup). |
+| `data_ops` | Operational metadata: run locks, run history, extraction checkpoints, asset registry, and coverage watermarks. |
+
+## Key design decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Load strategies | `full_replace`, `upsert`, `append` | Covers all ETL patterns: full refresh, incremental sync, and event log append. |
+| Failure model | Temp table + checkpoints preserved on failure | Zero wasted API calls on retry — the next run resumes from where the last one stopped. |
+| Schema management | Auto-create with additive migration via `SchemaContract` enum (`EVOLVE` / `FREEZE` / `DISCARD`) | Safe evolution without data loss. No manual DDL required. |
+| Rate limiting | In-process sliding-window counter, thread-safe | Simple, no external state. One limiter instance shared across all worker threads. |
+| Parallelism | Thread pool for page/entity fan-out | Shares the rate limiter and token manager across workers without the overhead of multiprocessing. |
+| DB layer | SQLAlchemy ORM (metadata tables) + Core (DDL) | ORM for type-safe metadata models; Core for raw DDL control over asset tables. |
+| In-memory format | pandas `DataFrame` | Standard, well-supported in the data ecosystem. Used for transform, validate, and write steps. |
+| Bulk write safety | `chunksize=1000` on temp table inserts | Prevents PostgreSQL bind-parameter overflow on large DataFrames. |
+| Declarative indexes | Every asset declares `indexes` (at least one required); created after promotion via `CREATE INDEX IF NOT EXISTS` | Proactive query performance — indexes reflect expected query patterns, not reactive DBA work. |
+| Transform safety | Per-query `statement_timeout` (default 300 s, configurable per asset) | Prevents runaway SQL from holding connections indefinitely. |

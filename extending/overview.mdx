@@ -1,0 +1,80 @@
+---
+title: "Extending FlowKit"
+description: "Choose the right pattern for adding new data sources and transforms."
+---
+
+FlowKit is designed so that adding a new data source or transform requires only one new file in most cases. Before you write any code, this page helps you pick the right pattern.
+
+## Design principles
+
+Every change to the codebase must follow these five rules:
+
+1. **Simple and modular** — code must be understandable by junior developers and AI agents. Just modular enough for extension, not more.
+2. **Pure Python, self-sufficient** — the package handles all ETL logic itself. Only Airflow handles scheduling. No delegating core logic to external frameworks.
+3. **Simple patterns over complexity** — prefer 10 lines of clear code over importing a library. No unnecessary abstractions.
+4. **Battle-tested libraries only** — dependencies must be 5+ years old, popular in data engineering, and carry a liberal open-source license (MIT, Apache 2.0, BSD). Current deps: SQLAlchemy, pandas, httpx, python-dotenv, PyJWT, pysnc.
+5. **90%+ test coverage** — every module has unit tests. Integration tests use mocked APIs and testcontainers Postgres.
+
+---
+
+## Decision flowchart
+
+Walk through these four questions from top to bottom before writing any code.
+
+<AccordionGroup>
+  <Accordion title="Question 1: Where does the data come from?">
+    **External HTTP API** (PagerDuty, GitHub, Jira, SonarQube, etc.) → continue to Question 2.
+
+    **Existing Postgres tables** (aggregate, join, reshape existing raw data) → you need a **TransformAsset**. See [Transform assets](/extending/transforms).
+  </Accordion>
+
+  <Accordion title="Question 2: Is this a standard REST API?">
+    **Yes — standard pattern** (JSON response, page/offset/cursor pagination, field mapping) → use **RestAsset**. Declarative, ~25 lines, no extraction code to write. See [RestAsset](/extending/rest-asset).
+
+    **The source has an official Python SDK** (e.g., pysnc for ServiceNow) → override the `extract()` hook on your asset class. See [APIAsset](/extending/api-asset).
+
+    **No — needs custom request/response logic** (multi-endpoint iteration, computed query parameters like JQL, keyset pagination) → use **APIAsset**. Continue to Question 3.
+  </Accordion>
+
+  <Accordion title="Question 3: What kind of API call is it?">
+    **Lists a collection** (all projects, all repos, all users):
+    - No total count in response → `ParallelMode.NONE` (sequential)
+    - First response tells you total pages → `ParallelMode.PAGE_PARALLEL` (concurrent fetches)
+
+    **Fetches child data for each parent entity** (issues per project, commits per repo, alerts per service) → `ParallelMode.ENTITY_PARALLEL`. You also need a parent asset whose primary-key values become the entity keys for fan-out.
+  </Accordion>
+
+  <Accordion title="Question 4: How should data be loaded into Postgres?">
+    **Fetch everything every run; replace the whole table** → `LoadStrategy.FULL_REPLACE`
+
+    **Fetch new/changed data; merge by primary key** → `LoadStrategy.UPSERT`
+
+    **Append-only** (event logs, audit trails — never update old rows) → `LoadStrategy.APPEND`
+
+    **Default run mode:**
+    - Always fetch the full dataset → `RunMode.FULL`
+    - Normally fetch only data since the last run → `RunMode.FORWARD`
+    - Backfill historical data (triggered manually) → `RunMode.BACKFILL`
+  </Accordion>
+</AccordionGroup>
+
+With those four answers in hand, you know exactly which classes and attributes you need.
+
+---
+
+## Asset patterns
+
+<CardGroup cols={2}>
+  <Card title="RestAsset" icon="bolt" href="/extending/rest-asset">
+    Declarative. Define endpoint, pagination, and field mapping as class attributes. No `build_request()` or `parse_response()` code to write. Covers 80% of new data sources.
+  </Card>
+  <Card title="APIAsset" icon="code" href="/extending/api-asset">
+    Custom. Full control over request construction and response parsing. Use for complex APIs that need JQL, keyset pagination, multi-endpoint iteration, or SDK clients.
+  </Card>
+  <Card title="Token managers" icon="key" href="/extending/token-managers">
+    Authentication. Implement one of four patterns — static token, basic auth, OAuth2 client credentials, or JWT/GitHub App — for any new data source.
+  </Card>
+  <Card title="Transform assets" icon="database" href="/extending/transforms">
+    SQL-based. Produce derived Postgres tables from existing raw data using a single SQL SELECT. No API calls involved.
+  </Card>
+</CardGroup>

@@ -1,0 +1,355 @@
+---
+title: "Enums & types"
+description: "All enumerations and data types used in the FlowKit public API."
+---
+
+## RunMode
+
+`data_assets.core.enums.RunMode`
+
+Controls the extraction window and watermark update behavior for a run. Pass as the `run_mode` argument to `run_asset()`.
+
+```python
+from data_assets.core.enums import RunMode  # StrEnum
+
+class RunMode(StrEnum):
+    FULL      = "full"
+    FORWARD   = "forward"
+    BACKFILL  = "backfill"
+    TRANSFORM = "transform"
+```
+
+| Value | String | Description |
+|---|---|---|
+| `RunMode.FULL` | `"full"` | Extracts all data. Updates both the forward and backward coverage watermarks. Use for initial loads and full refreshes. |
+| `RunMode.FORWARD` | `"forward"` | Extracts from the last forward watermark to now. Updates the forward watermark only. Use for incremental runs that keep pace with new data. |
+| `RunMode.BACKFILL` | `"backfill"` | Extracts from the start of history up to the backward watermark. Updates the backward watermark only. Use to fill in historical gaps. |
+| `RunMode.TRANSFORM` | `"transform"` | Runs a SQL transform on existing Postgres tables (TransformAsset only). No date window is computed. |
+
+---
+
+## LoadStrategy
+
+`data_assets.core.enums.LoadStrategy`
+
+Determines how the runner promotes the extracted temp table into the target table.
+
+```python
+from data_assets.core.enums import LoadStrategy  # StrEnum
+
+class LoadStrategy(StrEnum):
+    FULL_REPLACE = "full_replace"
+    UPSERT       = "upsert"
+    APPEND       = "append"
+```
+
+| Value | String | Description |
+|---|---|---|
+| `LoadStrategy.FULL_REPLACE` | `"full_replace"` | Truncates the target table and inserts all rows from the temp table. Fastest option; no deduplication. |
+| `LoadStrategy.UPSERT` | `"upsert"` | Inserts new rows and updates existing rows matched by `primary_key`. Requires `primary_key` to be set. |
+| `LoadStrategy.APPEND` | `"append"` | Inserts all rows without removing any existing data. Use for event-log style tables where history is never modified. |
+
+---
+
+## ParallelMode
+
+`data_assets.core.enums.ParallelMode`
+
+Controls how an `APIAsset` fetches pages concurrently.
+
+```python
+from data_assets.core.enums import ParallelMode  # StrEnum
+
+class ParallelMode(StrEnum):
+    NONE            = "none"
+    PAGE_PARALLEL   = "page_parallel"
+    ENTITY_PARALLEL = "entity_parallel"
+```
+
+| Value | String | Description |
+|---|---|---|
+| `ParallelMode.NONE` | `"none"` | Sequential extraction: one page at a time, following pagination cursors. Default for most assets. |
+| `ParallelMode.PAGE_PARALLEL` | `"page_parallel"` | Fetches multiple pages concurrently using a thread pool of `max_workers`. Requires the total page count to be known upfront (e.g., from `pagination_config.total_path`). |
+| `ParallelMode.ENTITY_PARALLEL` | `"entity_parallel"` | Fetches data for multiple parent entities concurrently. Requires `parent_asset_name` and `build_entity_request()`. Each entity is extracted sequentially; entities run in parallel up to `max_workers`. |
+
+---
+
+## SchemaContract
+
+`data_assets.core.enums.SchemaContract`
+
+Determines how unexpected columns in extracted data are handled during promotion.
+
+```python
+from data_assets.core.enums import SchemaContract  # StrEnum
+
+class SchemaContract(StrEnum):
+    EVOLVE  = "evolve"
+    FREEZE  = "freeze"
+    DISCARD = "discard"
+```
+
+| Value | String | Description |
+|---|---|---|
+| `SchemaContract.EVOLVE` | `"evolve"` | New columns in the data are added to the target table automatically. Existing columns are never removed. |
+| `SchemaContract.FREEZE` | `"freeze"` | Columns not declared in `columns` raise an error. Use to enforce strict schema discipline. |
+| `SchemaContract.DISCARD` | `"discard"` | Extra columns in the data are silently dropped before promotion. Only declared columns are loaded. |
+
+---
+
+## IndexMethod
+
+`data_assets.core.enums.IndexMethod`
+
+Index access method used in the `method` field of an `Index`. Defaults to `BTREE`.
+
+```python
+from data_assets.core.enums import IndexMethod  # StrEnum
+
+class IndexMethod(StrEnum):
+    BTREE  = "btree"
+    GIN    = "gin"
+    GIST   = "gist"
+    HASH   = "hash"
+    BRIN   = "brin"
+    SPGIST = "spgist"
+```
+
+| Value | String | Best for |
+|---|---|---|
+| `IndexMethod.BTREE` | `"btree"` | Default. Equality (`=`), range (`<`, `>`, `BETWEEN`), and ordering. Covers 95%+ of use cases. |
+| `IndexMethod.GIN` | `"gin"` | JSONB columns and full-text search. Use when querying inside `JSONB` fields with `@>` or `?` operators. |
+| `IndexMethod.GIST` | `"gist"` | Geometric types, range types, and full-text search with `ts_vector`. |
+| `IndexMethod.HASH` | `"hash"` | Equality (`=`) only. Smaller than BTREE for pure equality lookups, but no range support. |
+| `IndexMethod.BRIN` | `"brin"` | Very large tables where values are naturally ordered (e.g., monotonically increasing timestamps). Tiny size, coarse granularity. |
+| `IndexMethod.SPGIST` | `"spgist"` | Space-partitioned data structures. Rarely needed for ETL use cases. |
+
+---
+
+## PaginationConfig
+
+`data_assets.core.types.PaginationConfig`
+
+Declares how an API endpoint is paginated. Used as the `pagination_config` attribute on `APIAsset`, or populated automatically from the `pagination` dict shorthand on `RestAsset`.
+
+```python
+@dataclass(frozen=True)
+class PaginationConfig:
+    strategy: str
+    page_size: int = 100
+    cursor_field: str | None = None
+    total_path: str | None = None
+    page_size_param: str = "ps"
+    page_number_param: str = "p"
+    limit_param: str = "limit"
+    offset_param: str = "offset"
+    page_index_path: str | None = None
+```
+
+<ParamField path="strategy" type="str" required>
+  Pagination strategy. One of:
+
+  | Value | Description |
+  |---|---|
+  | `"page_number"` | `?page=N&per_page=M` style (GitHub, SonarQube) |
+  | `"offset"` | `?offset=N&limit=M` style (Jira, legacy ServiceNow) |
+  | `"cursor"` | Opaque cursor token returned by the previous response |
+  | `"none"` | Single request, no pagination |
+
+  <Note>Keyset pagination is not supported by `RestAsset`. For keyset-paginated APIs, subclass `APIAsset` and implement `build_request()` and `parse_response()` directly.</Note>
+</ParamField>
+
+<ParamField path="page_size" type="int" default="100">
+  Number of records to request per page.
+</ParamField>
+
+<ParamField path="cursor_field" type="str | None" default="None">
+  Dot-path to the cursor value in the response JSON. Used when `strategy="cursor"`.
+</ParamField>
+
+<ParamField path="total_path" type="str | None" default="None">
+  Dot-path to the total record count in the response JSON (e.g., `"paging.total"`). When set, the runner can compute the total page count and enable page-parallel extraction.
+</ParamField>
+
+<ParamField path="page_size_param" type="str" default='"ps"'>
+  Query parameter name for page size. Override for APIs that use non-standard names (e.g., `"per_page"`, `"pageSize"`).
+</ParamField>
+
+<ParamField path="page_number_param" type="str" default='"p"'>
+  Query parameter name for page number. Override for APIs that use non-standard names (e.g., `"page"`, `"pageNumber"`).
+</ParamField>
+
+<ParamField path="limit_param" type="str" default='"limit"'>
+  Query parameter name for limit in offset-based pagination.
+</ParamField>
+
+<ParamField path="offset_param" type="str" default='"offset"'>
+  Query parameter name for offset in offset-based pagination.
+</ParamField>
+
+<ParamField path="page_index_path" type="str | None" default="None">
+  Dot-path to the current page index in the response JSON. Used by `RestAsset` to track the current page when `strategy="page_number"`. If `None`, the extractor uses a result-count heuristic.
+</ParamField>
+
+---
+
+## RequestSpec
+
+`data_assets.core.types.RequestSpec`
+
+Describes an HTTP request to be issued by the `APIClient`. Returned by `build_request()` and `build_entity_request()`.
+
+```python
+@dataclass(frozen=True)
+class RequestSpec:
+    method: str
+    url: str
+    params: dict | None = None
+    headers: dict | None = None
+    body: dict | None = None
+```
+
+<ParamField path="method" type="str" required>
+  HTTP method. Typically `"GET"` or `"POST"`.
+</ParamField>
+
+<ParamField path="url" type="str" required>
+  Full request URL including the base URL and path.
+</ParamField>
+
+<ParamField path="params" type="dict | None" default="None">
+  Query string parameters.
+</ParamField>
+
+<ParamField path="headers" type="dict | None" default="None">
+  Additional request headers. The `Authorization` header is added automatically by the `APIClient` from `token_manager.get_auth_header()`; do not set it here.
+</ParamField>
+
+<ParamField path="body" type="dict | None" default="None">
+  Request body for `POST` and `PUT` requests. Serialized as JSON.
+</ParamField>
+
+---
+
+## PaginationState
+
+`data_assets.core.types.PaginationState`
+
+Returned by `parse_response()` to tell the extraction engine whether to fetch the next page and how to construct the next request.
+
+```python
+@dataclass
+class PaginationState:
+    has_more: bool
+    cursor: str | None = None
+    next_offset: int | None = None
+    next_page: int | None = None
+    total_pages: int | None = None
+    total_records: int | None = None
+```
+
+<ParamField path="has_more" type="bool" required>
+  `True` if there are more pages to fetch. `False` stops pagination.
+</ParamField>
+
+<ParamField path="cursor" type="str | None" default="None">
+  Opaque cursor value to include in the next request. Used when `strategy="cursor"`.
+</ParamField>
+
+<ParamField path="next_offset" type="int | None" default="None">
+  Offset for the next page in offset-based pagination.
+</ParamField>
+
+<ParamField path="next_page" type="int | None" default="None">
+  Page number for the next request in page-number pagination.
+</ParamField>
+
+<ParamField path="total_pages" type="int | None" default="None">
+  Total page count. When provided, enables page-parallel extraction to pre-compute the full range of requests.
+</ParamField>
+
+<ParamField path="total_records" type="int | None" default="None">
+  Total record count from the API response. Stored for observability; not used for pagination logic.
+</ParamField>
+
+---
+
+## RunContext
+
+`data_assets.core.run_context.RunContext`
+
+Immutable snapshot of parameters for a single asset run. Created at the start of a run and passed through every phase — to `build_request()`, `parse_response()`, `transform()`, `validate()`, and `query()` on `TransformAsset`.
+
+```python
+@dataclass(frozen=True)
+class RunContext:
+    run_id: UUID
+    mode: RunMode
+    asset_name: str
+    partition_key: str = ""
+    start_date: datetime | None = None
+    end_date: datetime | None = None
+    params: dict = field(default_factory=dict)
+```
+
+<ParamField path="run_id" type="UUID" required>
+  UUIDv7 for this run. Correlates with the run history table.
+</ParamField>
+
+<ParamField path="mode" type="RunMode" required>
+  The active run mode for this execution.
+</ParamField>
+
+<ParamField path="asset_name" type="str" required>
+  Name of the asset being run.
+</ParamField>
+
+<ParamField path="partition_key" type="str" default='""'>
+  Partition key for this run. Empty string for unpartitioned runs.
+</ParamField>
+
+<ParamField path="start_date" type="datetime | None" default="None">
+  Start of the extraction date window. `None` for full and transform runs, or for incremental runs before the first successful load.
+</ParamField>
+
+<ParamField path="end_date" type="datetime | None" default="None">
+  End of the extraction date window. `None` for full and transform runs.
+</ParamField>
+
+<ParamField path="params" type="dict" default="{}">
+  Runtime overrides passed as `**overrides` to `run_asset()` (minus `dry_run`, which is consumed by the runner). Access custom overrides here in `build_request()` or `query()`.
+</ParamField>
+
+---
+
+## @register decorator
+
+`data_assets.core.registry.register`
+
+Registers an asset class in the global registry by its `name` attribute. Called automatically by the `discover()` function at first run, which walks all modules under `data_assets.assets` and triggers the decorator on import.
+
+```python
+def register(asset_cls: type[Asset]) -> type[Asset]:
+    """Register an asset class by its name. Can be used as a decorator."""
+```
+
+Use as a class decorator on every asset you define:
+
+```python
+from data_assets.core.registry import register
+from data_assets.core.rest_asset import RestAsset
+
+@register
+class MyAsset(RestAsset):
+    name = "my_asset"
+    ...
+```
+
+At discovery time, `register` stores the class in `_registry[asset_cls.name]`. If a name is already registered, a warning is logged and the new class overwrites the old one.
+
+After registration, `run_asset("my_asset")` will find and instantiate the class. The registry also validates at startup that:
+
+- All `parent_asset_name` references point to registered assets.
+- All `source_tables` entries match a registered asset's `target_table`.
+- Every asset declares at least one `Index`.
+- All index columns reference columns that exist in the asset's `columns` list.

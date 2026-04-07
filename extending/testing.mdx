@@ -1,0 +1,376 @@
+---
+title: "Testing"
+description: "Write unit tests and integration tests for custom assets using FlowKit's test patterns."
+---
+
+FlowKit has a strict 90%+ coverage requirement (currently 95.6%). Every new asset needs unit tests before merging. This page covers the test structure, fixtures, and patterns you need.
+
+## Quick reference
+
+```bash
+make test-unit           # Unit tests only (no Docker required)
+make test-integration    # Integration tests (requires Docker)
+make test                # All tests
+make test-cov            # Unit tests with coverage report
+
+# Directly with pytest:
+.venv/bin/python -m pytest tests/unit/ -v
+.venv/bin/python -m pytest tests/unit/assets/test_sonarqube.py -v
+.venv/bin/python -m pytest tests/unit/ -k "test_parse_response"
+
+# Full coverage report (unit + integration, as used by SonarQube):
+.venv/bin/python -m pytest tests/ --cov=src/data_assets --cov-report=xml:coverage.xml
+```
+
+---
+
+## Test directory structure
+
+```
+tests/
+├── conftest.py                     # Root fixtures (shared by ALL tests)
+│
+├── fixtures/                       # JSON API response fixtures
+│   ├── github/                     #   12 files (repos, PRs, branches, ...)
+│   ├── jira/                       #   2 files (projects, issues)
+│   ├── servicenow/                 #   13 files (incidents, changes, ...)
+│   └── sonarqube/                  #   3 files (projects, issues, measures)
+│
+├── unit/                           # Fast tests — no DB, no network, no Docker
+│   ├── conftest.py                 #   make_ctx() helper + env fixtures
+│   ├── assets/                     #   Asset-level tests
+│   │   ├── test_github.py
+│   │   ├── test_servicenow.py
+│   │   ├── test_jira.py
+│   │   └── test_sonarqube.py
+│   ├── core/                       #   Framework classes
+│   ├── extract/                    #   API client, rate limiter, token managers
+│   ├── runner/                     #   Orchestrator logic
+│   ├── db/                         #   Engine factory, schema creation
+│   ├── transform/                  #   SQL transform execution
+│   └── validation/                 #   Validator functions
+│
+└── integration/                    # Slow tests — real Postgres via testcontainers
+    ├── conftest.py                 #   stub_token_manager, run_engine, seed_table
+    ├── test_e2e.py                 #   Full run_asset() lifecycle
+    ├── test_loader.py              #   DDL, temp tables, promotion strategies
+    ├── test_checkpoint.py          #   Checkpoint save/resume/recovery
+    └── test_run_tracker.py         #   Run history recording
+```
+
+| Directory | What it tests | Needs Docker? | Mocking style |
+|---|---|---|---|
+| `unit/assets/` | Each asset's `build_request()` and `parse_response()` | No | `monkeypatch` for env vars, JSON fixtures for responses |
+| `unit/core/` | Framework classes (Asset, Column, RestAsset, Registry) | No | Direct instantiation, minimal mocking |
+| `unit/extract/` | API client, rate limiter, parallel extraction, token managers | No | `respx` for HTTP, `monkeypatch` for env, `MagicMock` |
+| `unit/runner/` | Orchestrator logic (routing, error paths, watermarks) | No | Heavy `@patch` — mocks engine, DB calls, asset methods |
+| `integration/` | Full pipeline against real Postgres | Yes | `respx` for HTTP + testcontainers for DB |
+
+---
+
+## Fixtures and helpers
+
+### Root conftest (tests/conftest.py)
+
+Available in all tests:
+
+| Fixture/Helper | Type | Description |
+|---|---|---|
+| `StubTokenManager` | Class | Minimal token manager — `get_token()` returns `"test-token"` |
+| `_clean_registry` | Autouse fixture | Isolates the asset registry between tests (prevents `@register` leakage) |
+| `pg_engine` | Session fixture | Real Postgres via testcontainers (integration tests only) |
+| `clean_db` | Function fixture | Truncates all tables before each test, returns engine |
+| `load_fixture` | Function fixture | Callable: `load_fixture("github/repos_org1.json")` |
+
+### Unit conftest (tests/unit/conftest.py)
+
+| Fixture/Helper | Type | Description |
+|---|---|---|
+| `make_ctx(**kwargs)` | Function | Creates `RunContext` with defaults: `run_id=uuid4(), mode=FULL, asset_name="test"` |
+| `github_env` | Fixture | Sets `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY`, `GITHUB_INSTALLATION_ID`, `GITHUB_ORGS` |
+| `jira_env` | Fixture | Sets `JIRA_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` |
+| `sonarqube_env` | Fixture | Sets `SONARQUBE_URL`, `SONARQUBE_TOKEN` |
+| `servicenow_env` | Fixture | Sets `SERVICENOW_INSTANCE`, `SERVICENOW_USERNAME`, `SERVICENOW_PASSWORD` |
+
+### Integration conftest (tests/integration/conftest.py)
+
+| Fixture/Helper | Type | Description |
+|---|---|---|
+| `stub_token_manager(cls)` | Context manager | Patches a TokenManager subclass to skip real credential resolution |
+| `run_engine` | Fixture | Patches `get_engine()` everywhere to use test Postgres |
+| `seed_table(engine, schema, table, rows)` | Function | Inserts setup data into a table before a test |
+
+---
+
+## Pattern 1: Testing a new asset
+
+When you add or modify an asset, you need a fixture file and a test file.
+
+<Steps>
+  <Step title="Create a JSON fixture">
+    Save a file matching the real API response shape at `tests/fixtures/<source>/<endpoint>.json`. Use fake data — replace real names, emails, and IDs:
+
+    ```json tests/fixtures/pagerduty/incidents_page1.json
+    {
+      "incidents": [
+        {
+          "id": "P123ABC",
+          "incident_number": 42,
+          "title": "CPU usage critical on web-01",
+          "status": "resolved",
+          "urgency": "high",
+          "priority": {"summary": "P1"},
+          "service": {"id": "SVC001", "summary": "Web Cluster"},
+          "created_at": "2025-06-15T08:30:00Z",
+          "last_status_change_at": "2025-06-15T10:15:00Z",
+          "resolved_at": "2025-06-15T10:15:00Z",
+          "html_url": "https://mycompany.pagerduty.com/incidents/P123ABC"
+        }
+      ],
+      "limit": 100,
+      "offset": 0,
+      "total": 1,
+      "more": false
+    }
+    ```
+
+    Keep 2–3 records per fixture — enough to test pagination and edge cases.
+  </Step>
+
+  <Step title="Write unit tests">
+    Create `tests/unit/assets/test_pagerduty.py`. Every asset needs at minimum these tests:
+
+    ```python tests/unit/assets/test_pagerduty.py
+    """Tests for PagerDuty incidents asset."""
+    import json
+    from pathlib import Path
+
+    from tests.unit.conftest import make_ctx
+
+    FIXTURES = Path(__file__).parent.parent.parent / "fixtures" / "pagerduty"
+
+
+    class TestPagerDutyIncidentsBuildRequest:
+        def test_first_page(self, pagerduty_env):
+            from data_assets.assets.pagerduty.incidents import PagerDutyIncidents
+
+            spec = PagerDutyIncidents().build_request(make_ctx(), checkpoint=None)
+            assert spec.method == "GET"
+            assert "/incidents" in spec.url
+            assert spec.params["offset"] == 0
+
+        def test_with_checkpoint(self, pagerduty_env):
+            from data_assets.assets.pagerduty.incidents import PagerDutyIncidents
+
+            spec = PagerDutyIncidents().build_request(
+                make_ctx(), checkpoint={"next_offset": 200}
+            )
+            assert spec.params["offset"] == 200
+
+        def test_incremental_adds_since_param(self, pagerduty_env):
+            from datetime import datetime, timezone
+            from data_assets.assets.pagerduty.incidents import PagerDutyIncidents
+
+            ctx = make_ctx(start_date=datetime(2025, 1, 1, tzinfo=timezone.utc))
+            spec = PagerDutyIncidents().build_request(ctx)
+            assert "since" in spec.params
+
+
+    class TestPagerDutyIncidentsParseResponse:
+        def test_happy_path(self, pagerduty_env):
+            from data_assets.assets.pagerduty.incidents import PagerDutyIncidents
+
+            data = json.loads((FIXTURES / "incidents_page1.json").read_text())
+            df, state = PagerDutyIncidents().parse_response(data)
+            assert len(df) == 1
+            assert df.iloc[0]["id"] == "P123ABC"
+            assert df.iloc[0]["service_name"] == "Web Cluster"
+            assert state.has_more is False
+
+        def test_empty_response(self, pagerduty_env):
+            from data_assets.assets.pagerduty.incidents import PagerDutyIncidents
+
+            df, state = PagerDutyIncidents().parse_response(
+                {"incidents": [], "more": False, "total": 0}
+            )
+            assert len(df) == 0
+            # Column names must match the asset's columns definition
+            assert list(df.columns) == [c.name for c in PagerDutyIncidents().columns]
+            assert state.has_more is False
+    ```
+
+    **Key conventions:**
+    - Organize tests as classes: `TestAssetNameBuildRequest`, `TestAssetNameParseResponse`
+    - Import the asset class inside each test method to avoid import-time side effects from `@register`
+    - Use the `<source>_env` fixture to set required env vars
+    - Test first page (no checkpoint), with checkpoint, and with `start_date`
+    - Verify column names match the asset's `columns` definition on empty response
+  </Step>
+
+  <Step title="Add an env fixture for the new source">
+    If this is a new source, add an env fixture to `tests/unit/conftest.py`:
+
+    ```python tests/unit/conftest.py
+    @pytest.fixture
+    def pagerduty_env(monkeypatch):
+        """Set all PagerDuty env vars needed to instantiate PagerDuty assets."""
+        monkeypatch.setenv("PAGERDUTY_URL", "https://api.pagerduty.com")
+        monkeypatch.setenv("PAGERDUTY_TOKEN", "test-token")
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Pattern 2: Testing framework internals
+
+For modules in `core/`, `extract/`, `db/`, etc., use `@patch` and `MagicMock` to isolate the code under test from its dependencies.
+
+```python
+from unittest.mock import MagicMock, patch
+
+class TestExtractRoute:
+    @patch("data_assets.runner.execute_transform")
+    @patch("data_assets.runner._check_source_freshness")
+    def test_transform_asset_route(self, mock_fresh, mock_exec):
+        """TransformAsset routes to execute_transform."""
+        mock_exec.return_value = 42
+        asset = MagicMock(spec=TransformAsset)
+        asset.query.return_value = "SELECT 1"
+        asset.query_timeout_seconds = 300
+
+        rows, stats = _run_extraction(asset, engine, "tmp", ctx, {}, {})
+        assert rows == 42
+        mock_exec.assert_called_once()
+```
+
+**When to use which mock tool:**
+
+| Tool | Use when |
+|---|---|
+| `monkeypatch.setenv()` | Setting/clearing environment variables |
+| `respx` | Mocking HTTP calls made by `httpx` |
+| `@patch("module.path.function")` | Replacing a function/class at import path |
+| `MagicMock(spec=SomeClass)` | Creating a fake object that respects an interface |
+| `MagicMock()` (no spec) | Quick mock when you don't need type safety |
+
+---
+
+## Pattern 3: Integration tests
+
+Integration tests call `run_asset()` with a real Postgres database and mocked HTTP responses. They verify end-to-end behavior including DDL creation, data loading, and promotion.
+
+```python tests/integration/test_sonarqube_e2e.py
+import respx
+import httpx
+import pytest
+
+@pytest.mark.integration
+@respx.mock
+def test_full_run(run_engine, monkeypatch, load_fixture):
+    """End-to-end: mock API → extract → load → verify in DB."""
+    from tests.integration.conftest import stub_token_manager
+    from data_assets.assets.sonarqube.projects import SonarQubeProjects
+    from data_assets.extract.token_manager import SonarQubeTokenManager
+
+    monkeypatch.setenv("SONARQUBE_URL", "https://sonar.test")
+    monkeypatch.setenv("SONARQUBE_TOKEN", "fake")
+
+    fixture_data = load_fixture("sonarqube/projects.json")
+
+    # Mock the API response
+    respx.get("https://sonar.test/api/components/search").mock(
+        return_value=httpx.Response(200, json=fixture_data)
+    )
+
+    with stub_token_manager(SonarQubeTokenManager):
+        from data_assets import run_asset
+        result = run_asset("sonarqube_projects", "full")
+
+    assert result["rows_loaded"] > 0
+
+    # Verify data landed in the correct table
+    import pandas as pd
+    df = pd.read_sql("SELECT * FROM raw.sonarqube_projects", run_engine)
+    assert len(df) == expected_count
+```
+
+**Integration test requirements:**
+- Always use `@pytest.mark.integration` marker
+- Use `run_engine` fixture (patches `get_engine()` to use test Postgres)
+- Use `stub_token_manager()` to bypass real credential resolution
+- Use `respx` to mock HTTP — never make real API calls in tests
+- Seed parent tables with `seed_table()` if the asset depends on a parent (entity-parallel)
+
+---
+
+## Checklist: what to test
+
+**For every new asset:**
+
+- [ ] `build_request()` — first page (no checkpoint)
+- [ ] `build_request()` — with checkpoint (pagination resume)
+- [ ] `build_request()` — with `start_date` (incremental mode, if applicable)
+- [ ] `parse_response()` — happy path with fixture data
+- [ ] `parse_response()` — empty response returns correct column names
+- [ ] `parse_response()` — pagination state (`has_more`, `next_page`/`next_offset`/`cursor`)
+- [ ] `primary_key` — verify it's set and matches expected columns
+- [ ] `indexes` — verify at least one index is defined
+- [ ] `filter_entity_keys()` — if entity-parallel, verify filtering logic
+- [ ] `should_stop()` — if overridden, test watermark-based early stop
+
+**Before submitting a PR:**
+
+```bash
+make test-unit    # all unit tests pass
+make lint         # no lint errors
+make typecheck    # no type errors (optional but recommended)
+```
+
+---
+
+## Debugging failed tests
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `RuntimeError: GITHUB_APP_ID` | Missing env fixture | Add `github_env` (or the relevant source fixture) to your test |
+| `KeyError` in `_registry` | Asset not registered | Ensure `@register` decorator is on the class |
+| `respx.CallNotMocked` | HTTP call not mocked | Add `respx.get(url).mock(...)` for the endpoint |
+| Integration test skipped | Docker not running | Start Docker Desktop / `colima start` / `systemctl start podman` |
+| `AttributeError: 'MagicMock'` | Mock missing attribute | Use `MagicMock(spec=RealClass)` or set the attribute explicitly |
+| Test passes alone, fails in suite | Registry leakage | The `_clean_registry` autouse fixture handles this; check import-time side effects |
+
+**Running a single test with verbose output:**
+
+```bash
+# Single test class
+.venv/bin/python -m pytest tests/unit/assets/test_github.py::TestGitHubReposBuildRequest -v
+
+# Single test method
+.venv/bin/python -m pytest tests/unit/assets/test_github.py::TestGitHubReposBuildRequest::test_first_page -v
+
+# With print output visible
+.venv/bin/python -m pytest tests/unit/assets/test_github.py -v -s
+
+# Stop on first failure
+.venv/bin/python -m pytest tests/unit/ -x
+
+# Show local variables in tracebacks
+.venv/bin/python -m pytest tests/unit/ --tb=long
+```
+
+---
+
+## Test dependencies
+
+All test dependencies are in `pyproject.toml` under `[project.optional-dependencies] dev`. Install with: `uv pip install -e ".[dev]"`
+
+| Package | Purpose |
+|---|---|
+| `pytest >= 8.0` | Test framework |
+| `pytest-cov` | Coverage reporting (`--cov` flag) |
+| `pytest-mock` | `mocker` fixture (wrapper around `unittest.mock`) |
+| `respx >= 0.21` | HTTP mocking for `httpx` |
+| `testcontainers[postgres] >= 4.0` | Ephemeral Postgres containers for integration tests |
+| `ruff` | Linter |
+| `mypy` | Type checker |

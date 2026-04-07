@@ -1,0 +1,193 @@
+---
+title: "ETL run lifecycle"
+description: "The five phases of a FlowKit run: initialize, extract, transform & validate, promote, and finalize."
+---
+
+Every `run_asset()` call follows the same five-phase lifecycle. Each phase has a well-defined responsibility, and failure at any point triggers a consistent cleanup path that preserves checkpoints for retry.
+
+<Note>
+  Run IDs are UUIDv7 — timestamp-ordered and lexicographically sortable. This means `ORDER BY run_id` in `data_ops.run_history` gives chronological order without a separate timestamp index.
+</Note>
+
+## Phase 1: Initialize
+
+Before any data moves, the runner acquires a run lock in `data_ops.run_locks`. The lock is a row scoped to `(asset_name, partition_key)`, preventing concurrent runs of the same asset from overwriting each other.
+
+**What happens:**
+
+1. A new UUIDv7 `run_id` is generated.
+2. `acquire_or_takeover()` is called. It attempts to insert a new lock row, using `SELECT ... FOR UPDATE` to prevent race conditions.
+3. Coverage watermarks are read from `data_ops.coverage_tracker` to compute the extraction date window (`start_date`, `end_date`).
+4. Any existing checkpoints are loaded from `data_ops.checkpoints` so extraction can resume.
+
+**Stale-run takeover:**
+
+If a lock row already exists, the runner checks two conditions:
+
+- `heartbeat_at` is older than `stale_heartbeat_minutes` (default: 20 minutes) — the worker stopped making progress.
+- `locked_at` is older than `max_run_hours` (default: 5 hours) — the run exceeded the maximum wall time.
+
+If either condition is true, the abandoned run's lock is deleted and a new lock is created. The abandoned run's temp table name and checkpoints are **inherited** — the new run continues where the dead worker left off. The abandoned run is recorded as failed in `data_ops.run_history`.
+
+```python
+# From checkpoint/manager.py — stale-run takeover detection
+heartbeat_stale = heartbeat_age > timedelta(minutes=stale_heartbeat_minutes)
+run_exceeded = run_age > timedelta(hours=max_run_hours)
+
+if heartbeat_stale or run_exceeded:
+    # Take over: inherit temp table + checkpoints
+    inherited_temp = existing.temp_table
+    abandoned_run_id = existing.run_id
+```
+
+## Phase 2: Extract
+
+The runner creates (or reuses) a temp table in `temp_store` and populates it with raw data.
+
+**Temp table setup:**
+
+- On a fresh run: `CREATE UNLOGGED TABLE temp_store.<asset>_<run_id_prefix>` using the asset's `columns` definition.
+- On a takeover: if the inherited temp table still exists (it survives Postgres restarts because it is in `temp_store`, not a session-local `TEMP TABLE`), it is reused as-is. Partial data from the abandoned run is preserved.
+
+**Extraction path:**
+
+The runner picks one of three paths based on asset type:
+
+| Asset type | Path |
+|-----------|------|
+| Custom `extract()` hook (e.g., ServiceNow/pysnc) | `asset.extract(engine, temp_table, context)` called directly |
+| `APIAsset` with `parallel_mode=NONE` | `extract_sequential()` |
+| `APIAsset` with `parallel_mode=PAGE_PARALLEL` | `extract_page_parallel()` |
+| `APIAsset` with `parallel_mode=ENTITY_PARALLEL` | `extract_entity_parallel()` |
+| `TransformAsset` | SQL query executed via `execute_transform()` |
+
+**Extraction data flow (standard API path):**
+
+```
+                    ┌──────────────┐
+                    │  Runner      │
+                    │  run_asset() │
+                    └──────┬───────┘
+                           │
+              ┌────────────▼────────────┐
+              │ asset.build_request()    │◄──── checkpoint (page/offset/cursor)
+              │ → RequestSpec            │
+              └────────────┬────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │ APIClient.request()      │
+              │  ├─ rate_limiter.acquire()│
+              │  ├─ token_mgr.get_auth() │
+              │  └─ httpx.request()      │
+              └────────────┬────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │ asset.parse_response()   │
+              │ → (DataFrame,            │
+              │    PaginationState)       │
+              └────────┬────────┬───────┘
+                       │        │
+          ┌────────────▼──┐ ┌───▼──────────────┐
+          │ write_to_temp()│ │ save_checkpoint() │
+          │ → temp_store   │ │ → data_ops        │
+          └────────────────┘ └──────────────────┘
+                       │
+                       │  state.has_more?
+                       │  YES → loop back to build_request()
+                       │  NO  → proceed to transform & validate
+```
+
+Each page write uses `chunksize=1000` to prevent PostgreSQL bind-parameter overflow on large DataFrames.
+
+## Phase 3: Transform & validate
+
+After extraction, the full temp table is loaded into a pandas `DataFrame` and passed through the asset's optional transform and validation steps.
+
+**Transform:**
+
+If the asset overrides `transform(df)`, the runner:
+
+1. Calls `asset.transform(df)` with the full extracted DataFrame.
+2. Drops the old temp table.
+3. Creates a new temp table and writes the transformed DataFrame into it.
+
+Row count changes (e.g., deduplication or enrichment) are logged at INFO level.
+
+**Validate:**
+
+Every asset's `validate(df, context)` is called unconditionally. The result has two paths:
+
+- **Failures** (`validation_result.passed == False`): the run raises `ValueError` with all failure messages concatenated. The failure path is triggered.
+- **Warnings** (`asset.validate_warnings(df, context)`): warnings are logged at WARNING level and included in the run result's `metadata` dict. The run continues.
+
+## Phase 4: Promote
+
+Data moves from the temp table to the main target table in a **single transaction**. The atomic move means the main table is never in a partially updated state.
+
+```python
+# From runner.py — promotion call
+return promote(
+    engine=engine, temp_table=temp_tbl,
+    target_schema=asset.target_schema, target_table=asset.target_table,
+    columns=asset.columns, primary_key=asset.primary_key,
+    load_strategy=asset.load_strategy,
+    schema_contract=asset.schema_contract,
+    indexes=asset.indexes,
+)
+```
+
+Inside `promote()`:
+
+1. The target table is created if it doesn't exist.
+2. Any new columns are managed per `schema_contract` (EVOLVE / FREEZE / DISCARD).
+3. Duplicate rows in the temp table (possible from retry runs) are removed using `ctid`-based deduplication before the main operation.
+4. The load strategy is applied in a single transaction:
+   - **FULL_REPLACE**: `TRUNCATE` target, then `INSERT ... SELECT` from temp.
+   - **UPSERT**: `INSERT ... ON CONFLICT (primary_key) DO UPDATE`.
+   - **APPEND**: `INSERT ... SELECT` with no conflict handling.
+5. Declared indexes are created (or confirmed to exist) after the transaction, using `CREATE INDEX IF NOT EXISTS`.
+
+**Dry run:**
+
+When `run_asset(..., dry_run=True)` is called, the extract and validate phases run normally but promotion is skipped entirely. The run result has `status: "dry_run"` and `rows_loaded: 0`.
+
+## Phase 5: Finalize
+
+On success, the runner performs cleanup and records the outcome:
+
+1. **Update coverage watermarks** — if the asset has a `date_column`, the min/max values from the promoted DataFrame are written to `data_ops.coverage_tracker` to advance the forward and backward watermarks for the next run.
+2. **Record run success** — a row is inserted in `data_ops.run_history` with `rows_extracted`, `rows_loaded`, `extraction_seconds`, `promotion_seconds`, and any validation warnings.
+3. **Clear checkpoints** — all checkpoint rows for the asset are deleted from `data_ops.checkpoints`.
+4. **Drop temp table** — the `temp_store` table is dropped.
+5. **Release lock** — the `data_ops.run_locks` row is deleted.
+
+## Failure path
+
+If an exception is raised at any phase:
+
+1. `record_run_failure()` writes the error message to `data_ops.run_history`.
+2. `drop_temp_table()` is attempted. If the drop fails (e.g., Postgres connection lost), the error is logged at WARNING and suppressed — temp tables are cleaned up on the next successful run.
+3. `release_lock()` deletes the lock row.
+4. **Checkpoints are not cleared.** They remain in `data_ops.checkpoints` so the next run can resume extraction from where this one stopped.
+
+## Run result
+
+A successful `run_asset()` call returns:
+
+```python
+{
+    "run_id": "01959f4a-...",           # UUIDv7
+    "asset_name": "sonarqube_projects",
+    "partition_key": "",                 # non-empty for multi-org runs
+    "rows_extracted": 312,
+    "rows_loaded": 312,
+    "duration_seconds": 4.87,
+    "status": "success",                 # or "dry_run"
+    "metadata": {
+        "extraction_seconds": 3.91,
+        "promotion_seconds": 0.14,
+        "warnings": [],
+        "api_calls": 7,
+    }
+}
+```

@@ -1,0 +1,211 @@
+---
+title: "Schema management"
+description: "How FlowKit auto-creates tables, manages column migrations, and handles schema evolution."
+---
+
+FlowKit manages all database schema automatically. You declare your asset's columns and indexes in Python. FlowKit creates the tables, handles migrations, and maintains indexes — with no manual DDL required.
+
+## Auto-creation on first run
+
+On the first call to `run_asset()`, FlowKit runs a one-time initialization that creates all required schemas and metadata tables:
+
+```python
+# runner.py
+def _ensure_initialized(engine):
+    create_all_tables(engine)   # data_ops schema + all metadata tables
+    discover()                  # scan and register all asset classes
+    register_asset_metadata(engine, all_assets())
+```
+
+The four schemas (`raw`, `mart`, `temp_store`, `data_ops`) and all `data_ops` metadata tables (`run_locks`, `run_history`, `checkpoints`, `asset_registry`, `coverage_tracker`) are created idempotently. Subsequent calls skip initialization entirely via a module-level flag.
+
+Asset target tables (e.g., `raw.sonarqube_projects`) are created during the first promotion — not at import time. This means unused assets have no footprint in the database.
+
+## Column definition
+
+Columns are declared using the `Column` dataclass from `data_assets.core.column`:
+
+```python
+from data_assets.core.column import Column
+
+columns = [
+    Column("project_key",   "TEXT",        nullable=False),
+    Column("name",          "TEXT",        nullable=True),
+    Column("visibility",    "TEXT",        nullable=True),
+    Column("last_analysis", "TIMESTAMPTZ", nullable=True),
+    Column("lines_of_code", "INTEGER",     nullable=True),
+    Column("quality_gate",  "TEXT",        nullable=True),
+    Column("fetched_at",    "TIMESTAMPTZ", nullable=False, default="now()"),
+]
+```
+
+### Supported `pg_type` values
+
+| Type | Use for |
+|------|---------|
+| `TEXT` | Strings, identifiers, enum-like values |
+| `INTEGER` | Counts, page numbers, integer IDs |
+| `FLOAT` | Numeric metrics, ratios |
+| `BOOLEAN` | Flags, binary state |
+| `TIMESTAMPTZ` | Timestamps with time zone (preferred over `TIMESTAMP`) |
+| `JSONB` | Nested objects, arrays, variable-structure data |
+| `DATE` | Calendar dates without time |
+
+## Schema evolution
+
+As assets evolve, their column definitions change. FlowKit handles column additions automatically via the `schema_contract` attribute on each asset (default: `EVOLVE`).
+
+```python
+from data_assets.core.enums import SchemaContract
+
+class MyAsset(APIAsset):
+    schema_contract = SchemaContract.EVOLVE  # default
+```
+
+<Tip>
+  Use `EVOLVE` for most assets. Switch to `FREEZE` during a migration freeze (e.g., immediately before a major release) and back to `EVOLVE` once your schema is stable. Use `DISCARD` only when an upstream API adds fields you have no intention of storing.
+</Tip>
+
+| Contract | Behavior |
+|----------|----------|
+| `EVOLVE` | New columns in the asset definition are automatically added to the table via `ALTER TABLE ... ADD COLUMN`. Existing rows get `NULL` for the new column (or the declared `default`). No data is lost. |
+| `FREEZE` | If the asset definition contains columns not present in the existing table, the run raises `ValueError` immediately. Use to prevent unreviewed schema changes from landing in production. |
+| `DISCARD` | New columns in the asset definition are silently ignored. The table schema stays as-is. Use when an upstream API adds fields you don't want to store. |
+
+The `ensure_columns()` function in `load/loader.py` handles the migration logic:
+
+```python
+# load/loader.py
+def ensure_columns(engine, schema, table_name, columns, schema_contract="evolve"):
+    existing = {c["name"] for c in insp.get_columns(table_name, schema=schema)}
+    new_cols = [c for c in columns if c.name not in existing]
+
+    if schema_contract == "freeze":
+        raise ValueError(f"Schema contract 'freeze' violated: new columns {names} ...")
+
+    if schema_contract == "discard":
+        return  # silently skip
+
+    # Default: evolve — add new columns
+    for col in new_cols:
+        conn.execute(text(
+            f'ALTER TABLE "{schema}"."{table_name}" ADD COLUMN {_column_ddl(col)}'
+        ))
+```
+
+## Indexes
+
+Every asset must declare at least one index. Indexes are created (or confirmed to exist) after each promotion using `CREATE INDEX IF NOT EXISTS` — safe to call on every run.
+
+Indexes are declared using the `Index` dataclass:
+
+```python
+from data_assets.core.column import Index
+from data_assets.core.enums import IndexMethod
+
+indexes = [
+    # Simple btree on primary key column
+    Index(columns=("project_key",), unique=True),
+
+    # Composite index
+    Index(columns=("project_key", "fetched_at")),
+
+    # Partial index — only open items
+    Index(columns=("assignee",), where="status = 'open'"),
+
+    # GIN index for JSONB column
+    Index(columns=("metadata",), method=IndexMethod.GIN),
+
+    # Covering index — include column avoids heap fetch
+    Index(columns=("project_key",), include=("name", "visibility")),
+
+    # Explicit name (overrides auto-generation)
+    Index(columns=("project_key",), name="ix_projects_pk"),
+]
+```
+
+### `Index` constructor reference
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `columns` | `tuple[str, ...]` | required | Column names. Order matters for composite indexes. |
+| `unique` | `bool` | `False` | Creates a `UNIQUE INDEX`. |
+| `method` | `IndexMethod` | `BTREE` | Index access method: `BTREE`, `GIN`, `GIST`, `HASH`, `BRIN`, `SPGIST`. |
+| `where` | `str \| None` | `None` | Partial index `WHERE` clause (raw SQL, omit the `WHERE` keyword). |
+| `include` | `tuple[str, ...] \| None` | `None` | `INCLUDE` columns for a covering index. |
+| `name` | `str \| None` | `None` | Explicit index name. Auto-generated as `ix_{table}_{col}[_unique][_partial]` if omitted. Names are truncated to 63 characters (Postgres limit) with an MD5 suffix if needed. |
+
+## Load strategies in detail
+
+The `load_strategy` attribute on an asset determines how data moves from the temp table to the main table during promotion. All three strategies run inside a single database transaction.
+
+<Tip>
+  **Choosing a strategy:**
+  - Use `FULL_REPLACE` for assets that always re-fetch the complete dataset (e.g., SonarQube projects, which return all projects on every run).
+  - Use `UPSERT` for incremental loads where records can be updated after initial ingestion (e.g., GitHub pull requests — a PR opened last month may be closed today).
+  - Use `APPEND` for immutable event logs and audit trails where records are never updated (e.g., workflow run logs, incident history).
+</Tip>
+
+### FULL_REPLACE
+
+Truncates the main table, then inserts all rows from the temp table in one transaction. The main table is never empty outside the transaction — readers see either the old data or the new data, never a partial state.
+
+```sql
+-- loader.py: _promote_full_replace
+TRUNCATE TABLE "raw"."sonarqube_projects";
+INSERT INTO "raw"."sonarqube_projects" (col1, col2, ...)
+SELECT col1, col2, ... FROM "temp_store"."sonarqube_projects_01959f4a";
+```
+
+**Use for:** full-refresh assets where every run replaces the entire dataset.
+
+### UPSERT
+
+`INSERT ... ON CONFLICT (primary_key) DO UPDATE`. New rows are inserted; existing rows (matched by primary key) are updated to reflect the latest values. Rows in the main table that are not in the temp table are left untouched.
+
+```sql
+-- loader.py: _promote_upsert
+INSERT INTO "raw"."github_pull_requests" (col1, col2, ...)
+SELECT col1, col2, ... FROM "temp_store"."github_pull_requests_01959f4a"
+ON CONFLICT (pull_request_id) DO UPDATE SET
+    title = EXCLUDED.title,
+    state = EXCLUDED.state,
+    merged_at = EXCLUDED.merged_at;
+```
+
+**Use for:** incremental loads where records can change after initial ingestion.
+
+### APPEND
+
+`INSERT ... SELECT` with no conflict handling. All rows from the temp table are inserted into the main table. Duplicate keys will raise a constraint violation if a primary key is defined.
+
+```sql
+-- loader.py: _promote_append
+INSERT INTO "raw"."workflow_run_logs" (col1, col2, ...)
+SELECT col1, col2, ... FROM "temp_store"."workflow_run_logs_01959f4a";
+```
+
+**Use for:** immutable event logs and audit trails where records are write-once.
+
+## Temp table lifecycle
+
+Each run gets its own UNLOGGED temp table in the `temp_store` schema. UNLOGGED tables skip the WAL (write-ahead log), making bulk inserts significantly faster than regular tables — at the cost of not surviving a crash. This trade-off is acceptable because temp tables are always reconstructable from the source API.
+
+| Stage | Action |
+|-------|--------|
+| Run start | `CREATE UNLOGGED TABLE temp_store.<asset>_<run_id_prefix>` |
+| During extraction | `write_to_temp()` appends each page's DataFrame (chunksize=1000) |
+| Before promotion | Duplicate PK rows removed via `ctid`-based deduplication |
+| Promotion | Data moved to main table in one transaction |
+| After promotion | `DROP TABLE temp_store.<asset>_<run_id_prefix>` |
+| On failure | Drop attempted; if it fails, the table is left and cleaned up on next run |
+
+The table name includes the first 12 characters of the run ID (hex, no dashes), making it human-readable in `psql` while being unique per run:
+
+```python
+# load/loader.py
+def temp_table_name(asset_name, run_id):
+    short_id = str(run_id).replace("-", "")[:12]
+    return f"{asset_name}_{short_id}"
+# e.g. "sonarqube_projects_01959f4a8b3c"
+```

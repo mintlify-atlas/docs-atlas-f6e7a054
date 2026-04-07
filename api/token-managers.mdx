@@ -1,0 +1,225 @@
+---
+title: "Token managers reference"
+description: "Built-in token managers for each supported data source."
+---
+
+Token managers handle credential lifecycle for API assets: resolving secrets, caching tokens, and refreshing them before expiry. Every `APIAsset` subclass must set `token_manager_class` to a `TokenManager` subclass.
+
+## TokenManager
+
+`data_assets.extract.token_manager.TokenManager`
+
+Abstract base class for all token managers. Thread-safe by design — `get_token()` and `get_auth_header()` may be called from multiple extraction threads concurrently.
+
+```python
+from abc import ABC, abstractmethod
+import threading
+
+class TokenManager(ABC):
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    @abstractmethod
+    def get_token(self) -> str:
+        """Return a valid token or credential string."""
+
+    @abstractmethod
+    def get_auth_header(self) -> dict[str, str]:
+        """Return the HTTP Authorization header(s) for this source."""
+```
+
+The runner calls `asset.token_manager_class()` at the start of each extraction phase, then passes the instance to the `APIClient`. The instance is not reused across runs.
+
+---
+
+## CredentialResolver
+
+`data_assets.extract.token_manager.CredentialResolver`
+
+Resolves credentials from three sources, in priority order:
+
+<Steps>
+  <Step title="Airflow Connection">
+    Calls `BaseHook.get_connection(key)` and returns `conn.password` or `conn.get_uri()`. Falls back silently if Airflow is not installed or the connection does not exist.
+  </Step>
+  <Step title="Environment variable">
+    Reads `os.environ.get(key)`. This is where `run_asset(..., secrets={...})` injects credentials — they are present in the environment before the token manager is instantiated.
+  </Step>
+  <Step title=".env file">
+    Loaded once at module import time via `python-dotenv`. Populates `os.environ`, so this falls through to the same `os.environ.get(key)` call as step 2.
+  </Step>
+</Steps>
+
+All built-in token managers use a module-level `_resolver = CredentialResolver()` instance internally.
+
+---
+
+## Built-in token managers
+
+| Manager class | Source | Auth type | Required env vars |
+|---|---|---|---|
+| `GitHubAppTokenManager` | GitHub | JWT → installation token (1-hour TTL) | `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY`, `GITHUB_INSTALLATION_ID` |
+| `SonarQubeTokenManager` | SonarQube | Static Bearer token | `SONARQUBE_TOKEN` |
+| `JiraTokenManager` | Jira Cloud or Data Center | Basic (Cloud) or Bearer (DC) | `JIRA_EMAIL` + `JIRA_API_TOKEN` **or** `JIRA_PAT` |
+| `ServiceNowTokenManager` | ServiceNow | OAuth2 client credentials or HTTP Basic | `SERVICENOW_INSTANCE` + (`SERVICENOW_CLIENT_ID` + `SERVICENOW_CLIENT_SECRET`) **or** (`SERVICENOW_USERNAME` + `SERVICENOW_PASSWORD`) |
+
+---
+
+## GitHubAppTokenManager
+
+`data_assets.extract.token_manager.GitHubAppTokenManager`
+
+Generates GitHub App installation tokens via the JWT → installation token exchange. Tokens are valid for one hour; the manager proactively refreshes when the token is within 5 minutes of expiry.
+
+**Required env vars:**
+
+| Variable | Description |
+|---|---|
+| `GITHUB_APP_ID` | Numeric GitHub App ID |
+| `GITHUB_PRIVATE_KEY` | PEM-encoded RSA private key for the App |
+| `GITHUB_INSTALLATION_ID` | Installation ID for the target organization |
+
+```python
+from data_assets.extract.token_manager import GitHubAppTokenManager
+
+class MyGitHubAsset(APIAsset):
+    token_manager_class = GitHubAppTokenManager
+```
+
+---
+
+## SonarQubeTokenManager
+
+`data_assets.extract.token_manager.SonarQubeTokenManager`
+
+Static Bearer token authentication. The token is resolved once at instantiation and cached for the lifetime of the token manager instance.
+
+**Required env vars:**
+
+| Variable | Description |
+|---|---|
+| `SONARQUBE_TOKEN` | SonarQube user or project analysis token |
+
+```python
+from data_assets.extract.token_manager import SonarQubeTokenManager
+
+class MySonarQubeAsset(RestAsset):
+    token_manager_class = SonarQubeTokenManager
+    base_url_env = "SONARQUBE_URL"
+```
+
+---
+
+## JiraTokenManager
+
+`data_assets.extract.token_manager.JiraTokenManager`
+
+Supports both Jira Cloud and Jira Data Center authentication in a single class.
+
+- **Jira Cloud:** Basic auth using email address and API token (`JIRA_EMAIL` + `JIRA_API_TOKEN`).
+- **Jira Data Center:** Bearer auth using a Personal Access Token (`JIRA_PAT`).
+
+If `JIRA_PAT` is set, it takes precedence over the Cloud credentials.
+
+**Required env vars (choose one set):**
+
+| Variable | Description | Mode |
+|---|---|---|
+| `JIRA_PAT` | Personal Access Token | Data Center |
+| `JIRA_EMAIL` | User email address | Cloud |
+| `JIRA_API_TOKEN` | Atlassian API token | Cloud |
+
+```python
+from data_assets.extract.token_manager import JiraTokenManager
+
+class MyJiraAsset(RestAsset):
+    token_manager_class = JiraTokenManager
+    base_url_env = "JIRA_URL"
+```
+
+---
+
+## ServiceNowTokenManager
+
+`data_assets.extract.token_manager.ServiceNowTokenManager`
+
+Supports OAuth2 client credentials flow and HTTP Basic authentication.
+
+- **OAuth2:** Exchanges `SERVICENOW_CLIENT_ID` + `SERVICENOW_CLIENT_SECRET` for a Bearer token via the `/oauth_token.do` endpoint. Token is cached and refreshed 60 seconds before expiry.
+- **Basic auth:** Falls back to `SERVICENOW_USERNAME` + `SERVICENOW_PASSWORD` when client credentials are not provided.
+
+**Required env vars:**
+
+| Variable | Description | Required for |
+|---|---|---|
+| `SERVICENOW_INSTANCE` | Full instance URL (e.g., `https://myco.service-now.com`) | Both |
+| `SERVICENOW_CLIENT_ID` | OAuth2 client ID | OAuth2 |
+| `SERVICENOW_CLIENT_SECRET` | OAuth2 client secret | OAuth2 |
+| `SERVICENOW_USERNAME` | ServiceNow username | Basic auth |
+| `SERVICENOW_PASSWORD` | ServiceNow password | Basic auth |
+
+`SERVICENOW_INSTANCE` is always required. Providing `CLIENT_ID` + `CLIENT_SECRET` enables OAuth2; omitting them falls back to Basic auth using `USERNAME` + `PASSWORD`.
+
+The manager also exposes a `get_pysnc_auth()` method that returns credentials in the format expected by the `pysnc` ServiceNow client library.
+
+```python
+from data_assets.extract.token_manager import ServiceNowTokenManager
+
+class MyServiceNowAsset(RestAsset):
+    token_manager_class = ServiceNowTokenManager
+    base_url_env = "SERVICENOW_INSTANCE"
+```
+
+---
+
+## Implementing a custom token manager
+
+For sources not covered by the built-in managers, subclass `TokenManager` and implement the two abstract methods:
+
+```python
+import threading
+from data_assets.extract.token_manager import TokenManager, _resolver
+
+class MyAPITokenManager(TokenManager):
+    def __init__(self) -> None:
+        super().__init__()  # sets self._lock
+        self._token = _resolver.resolve("MY_API_TOKEN")
+        if not self._token:
+            raise RuntimeError("MY_API_TOKEN is required")
+
+    def get_token(self) -> str:
+        return self._token
+
+    def get_auth_header(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"}
+```
+
+For tokens that expire and need refreshing, use `self._lock` to make the refresh thread-safe:
+
+```python
+import time
+
+class MyOAuthTokenManager(TokenManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self._token: str | None = None
+        self._expires_at: float = 0.0
+        self._client_id = _resolver.resolve("MY_CLIENT_ID")
+        self._client_secret = _resolver.resolve("MY_CLIENT_SECRET")
+
+    def get_token(self) -> str:
+        with self._lock:
+            if self._token and time.time() < self._expires_at - 60:
+                return self._token
+            self._refresh()
+            return self._token
+
+    def get_auth_header(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.get_token()}"}
+
+    def _refresh(self) -> None:
+        # exchange client credentials for a token
+        ...
+```
+
+For more detail, see [Extending: token managers](/extending/token-managers).

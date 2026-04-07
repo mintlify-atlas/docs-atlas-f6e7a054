@@ -1,0 +1,111 @@
+---
+title: "GitHub assets"
+description: "Extract repository, pull request, workflow, and org data from GitHub using GitHub App authentication."
+---
+
+FlowKit uses a GitHub App installation token to authenticate all GitHub API requests. The token manager (`GitHubAppTokenManager`) signs a JWT with your app's private key, exchanges it for an installation access token, and refreshes automatically before expiry.
+
+## Authentication
+
+<Info>
+  See [Configuration — GitHub](/guides/configuration#github) for step-by-step instructions on creating a GitHub App and setting the required environment variables.
+</Info>
+
+| Environment variable | Required | Description |
+|----------------------|----------|-------------|
+| `GITHUB_APP_ID` | Yes | GitHub App ID (numeric) |
+| `GITHUB_PRIVATE_KEY` | Yes | PEM-encoded private key (full PEM contents including header/footer) |
+| `GITHUB_INSTALLATION_ID` | Yes | Installation ID for your org |
+| `GITHUB_ORGS` | Yes | Comma-separated list of org names (e.g., `my-org,second-org`) |
+| `GITHUB_API_URL` | No | Override for GitHub Enterprise Server (default: `https://api.github.com`) |
+
+For multi-org setups, run one Airflow task per org with the appropriate `GITHUB_INSTALLATION_ID` injected per task. The `GITHUB_ORGS` value is read at runtime — `get_github_org()` takes the first value in the list.
+
+---
+
+## Org-level assets
+
+These assets run sequentially and are scoped to the organization in `GITHUB_ORGS`.
+
+| Asset | Table | Load | API endpoint |
+|-------|-------|------|--------------|
+| `github_repos` | `raw.github_repos` | UPSERT | `GET /orgs/{org}/repos` |
+| `github_members` | `raw.github_members` | UPSERT | `GET /orgs/{org}/members` |
+| `github_runner_groups` | `raw.github_runner_groups` | UPSERT | `GET /orgs/{org}/actions/runner-groups` |
+
+All three use page-number pagination with `per_page=100`.
+
+---
+
+## Repo-scoped assets
+
+These assets fan out in parallel by repository, using `github_repos` as the parent. The framework loads `full_name` values from `raw.github_repos`, filters them to the current org via `filter_to_current_org()`, then dispatches up to 4 concurrent workers.
+
+| Asset | Table | Load | API endpoint | Entity key injection |
+|-------|-------|------|--------------|----------------------|
+| `github_pull_requests` | `raw.github_pull_requests` | UPSERT | `GET /repos/{repo}/pulls` | No — in response |
+| `github_branches` | `raw.github_branches` | FULL_REPLACE | `GET /repos/{repo}/branches` | Yes (`repo_full_name`) |
+| `github_commits` | `raw.github_commits` | UPSERT | `GET /repos/{repo}/commits` | Yes (`repo_full_name`) |
+| `github_workflows` | `raw.github_workflows` | FULL_REPLACE | `GET /repos/{repo}/actions/workflows` | Yes (`repo_full_name`) |
+| `github_workflow_runs` | `raw.github_workflow_runs` | UPSERT | `GET /repos/{repo}/actions/runs` | Yes (`repo_full_name`) |
+| `github_repo_properties` | `raw.github_repo_properties` | FULL_REPLACE | `GET /repos/{repo}/properties/values` | Yes (`repo_full_name`) |
+
+**Entity key injection:** When the GitHub API response does not include the repository name (e.g., the branches endpoint returns branch objects with no `repo_full_name` field), the framework injects the entity key as a column automatically after parsing. This is controlled by the `entity_key_column` attribute on each asset class — no custom code is needed in the asset itself.
+
+`github_pull_requests` sets `entity_key_column = None` because `repo_full_name` is already present in the response via `base.repo.full_name`.
+
+---
+
+## Deeper nested assets
+
+These assets fan out from a second-level parent — `github_members`, `github_workflow_runs`, or `github_runner_groups` — rather than from `github_repos`.
+
+| Asset | Table | Load | Parent | API endpoint |
+|-------|-------|------|--------|--------------|
+| `github_user_details` | `raw.github_user_details` | FULL_REPLACE | `github_members` | `GET /users/{login}` |
+| `github_workflow_jobs` | `raw.github_workflow_jobs` | UPSERT | `github_workflow_runs` | `GET /repos/{repo}/actions/runs/{run_id}/jobs` |
+| `github_runner_group_repos` | `raw.github_runner_group_repos` | FULL_REPLACE | `github_runner_groups` | `GET /orgs/{org}/actions/runner-groups/{id}/repositories` |
+
+`github_workflow_jobs` uses a **composite entity key** — a dict with `id` (run ID) and `repo_full_name` — loaded from `raw.github_workflow_runs`. Both fields are needed to build the URL. Join to `raw.github_workflow_runs` via `run_id` to get repo context in queries.
+
+---
+
+## Key design choices
+
+<AccordionGroup>
+  <Accordion title="Multi-org support">
+    One Airflow DAG per org. Each org can have its own GitHub App installation ID and secrets. The `filter_to_current_org()` helper filters entity keys (repo `full_name` values) to match `{GITHUB_ORGS}/` to prevent cross-org bleed when multiple DAGs write to the same database.
+  </Accordion>
+
+  <Accordion title="Incremental commits">
+    `github_commits` uses GitHub's `since` query parameter — the most efficient incremental strategy. Only commits after the last watermark are fetched.
+  </Accordion>
+
+  <Accordion title="Incremental PRs and workflow runs">
+    GitHub's pulls and workflow-runs endpoints have no `since` parameter. Both assets sort by `updated desc` and use `should_stop()` — pagination stops as soon as all records on a page are older than the watermark. This avoids scanning the full history on every incremental run.
+  </Accordion>
+
+  <Accordion title="Workflow jobs composite key">
+    `github_workflow_jobs` loads entity keys from `raw.github_workflow_runs` as `{id, repo_full_name}` pairs. The `repo_full_name` and `run_id` together build the API URL. The `repo_full_name` is not stored in `raw.github_workflow_jobs` — join to `raw.github_workflow_runs` via `run_id` for full context.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Example
+
+```python
+from data_assets import run_asset
+
+# Org-level — run sequentially
+run_asset("github_repos", run_mode="full")
+run_asset("github_members", run_mode="full")
+
+# Repo-scoped — incremental, runs in parallel by repo
+run_asset("github_pull_requests", run_mode="forward")
+run_asset("github_commits", run_mode="forward")
+
+# Nested — depends on workflow runs being up to date
+run_asset("github_workflow_runs", run_mode="forward")
+run_asset("github_workflow_jobs", run_mode="forward")
+```

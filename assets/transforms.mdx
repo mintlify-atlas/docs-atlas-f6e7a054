@@ -1,0 +1,81 @@
+---
+title: "Transform assets"
+description: "Postgres-to-Postgres derived tables that aggregate and reshape raw asset data."
+---
+
+Transform assets produce derived tables in the **`mart`** schema by running a SQL `SELECT` against tables in the **`raw`** schema. There are no API calls — the source data is already in PostgreSQL.
+
+Transforms are implemented by extending `TransformAsset` and implementing a single `query()` method that returns a SQL string. The framework executes the query, writes the result to a temp table, and atomically promotes it to the target table — the same atomic pattern used by all other assets.
+
+---
+
+## Current transforms
+
+| Asset | Table | Load | Source tables | Description |
+|-------|-------|------|---------------|-------------|
+| `incident_summary` | `mart.incident_summary` | FULL_REPLACE | `raw.servicenow_incidents` | Daily incident count grouped by priority and state |
+
+---
+
+## incident_summary
+
+Aggregates `raw.servicenow_incidents` into a daily summary, grouped by `priority` and `state`. Each row represents one combination of date, priority, and state with a count of incidents opened on that date.
+
+Columns: `report_date` (DATE), `priority` (TEXT), `state` (TEXT), `incident_count` (INTEGER)  
+Primary key: `report_date`, `priority`, `state`
+
+The underlying SQL:
+
+```sql
+SELECT
+    DATE(opened_at) AS report_date,
+    COALESCE(priority, 'Unknown') AS priority,
+    COALESCE(state, 'Unknown') AS state,
+    COUNT(*) AS incident_count
+FROM raw.servicenow_incidents
+WHERE opened_at IS NOT NULL
+GROUP BY DATE(opened_at), priority, state
+ORDER BY report_date DESC, priority, state
+```
+
+`NULL` values in `priority` or `state` are coerced to `'Unknown'` so they appear as a named bucket rather than being excluded from aggregates.
+
+Uses `FULL_REPLACE` because the aggregation always recomputes from the complete incidents table. There is no incremental benefit — any incident update (state change, priority change) would alter historical counts, so the whole summary must be rebuilt each run.
+
+---
+
+## Running a transform
+
+Pass `run_mode="transform"` to `run_asset()`:
+
+```python
+from data_assets import run_asset
+
+run_asset("incident_summary", run_mode="transform")
+```
+
+<Tip>
+  You can omit `run_mode` entirely — `TransformAsset` sets `default_run_mode = RunMode.TRANSFORM`, so `run_asset("incident_summary")` is equivalent to passing `run_mode="transform"`.
+</Tip>
+
+---
+
+## Dependency order
+
+Run the source asset before the transform. The transform reads from `raw.servicenow_incidents`, so that table must be populated first:
+
+```python
+# 1. Extract raw data from ServiceNow
+run_asset("servicenow_incidents", run_mode="forward")
+
+# 2. Rebuild the derived summary
+run_asset("incident_summary", run_mode="transform")
+```
+
+FlowKit logs a warning if the source table's most recent `sys_updated_on` value is more than 24 hours old when the transform runs, indicating that the raw data may be stale.
+
+---
+
+## Adding new transforms
+
+See [Extending — Transform assets](/extending/transforms) for a step-by-step guide to adding your own SQL-based derived tables.

@@ -1,0 +1,194 @@
+---
+title: "Parallel extraction"
+description: "How FlowKit's three extraction modes — sequential, page-parallel, and entity-parallel — work and when to use each."
+---
+
+FlowKit has three extraction modes controlled by the `parallel_mode` attribute on an asset. All three share the same underlying `_fetch_pages()` loop for the core request → parse → write → checkpoint cycle. The difference is how work units are determined and how they are distributed across threads.
+
+## Mode comparison
+
+| Mode | Use when | Requires | Example asset |
+|------|----------|----------|---------------|
+| `NONE` (sequential) | Tight rate limits, small datasets, or multi-endpoint assets | Nothing extra | GitHub org repos iterating through multiple orgs |
+| `PAGE_PARALLEL` | API returns total page/record count on first response | `total_pages` or `total_records` in first response | SonarQube projects |
+| `ENTITY_PARALLEL` | Fetching child resources for each parent entity | A parent asset already loaded in the DB | Jira issues per project, GitHub PRs per repo |
+
+## Sequential (NONE)
+
+The default mode. One thread. The runner calls `build_request(context, checkpoint)` on each iteration, and the asset returns a new `RequestSpec`. The asset fully controls the URL and parameters on every call — enabling multi-endpoint patterns like iterating through multiple GitHub orgs in a single run.
+
+```python
+# parallel.py — sequential extraction
+def extract_sequential(asset, client, engine, temp_table, context, checkpoint=None):
+    rows = _fetch_pages(
+        asset, client, engine, temp_table, context,
+        worker_id="main",
+        request_builder=lambda c: asset.build_request(context, checkpoint=c),
+        initial_checkpoint=cp,
+        log_interval_seconds=30.0,
+    )
+    return rows_so_far + rows
+```
+
+Progress is logged every 30 seconds since the total page count is not known upfront.
+
+**Checkpoint behavior:** a single `"main"` worker checkpoint is saved after each page.
+
+**Use when:** the API has strict rate limits, the dataset is small, or the asset needs to iterate across multiple endpoints or organizations.
+
+## Page-parallel
+
+For endpoints where the total number of pages (or records) is discoverable from the first response.
+
+**How it works:**
+
+1. A **discovery call** fetches page 1 and reads `total_pages` (or computes it from `total_records ÷ page_size`).
+2. Remaining pages `2..N` are partitioned evenly across `max_workers` threads.
+3. Each worker fetches its assigned pages sequentially and checkpoints independently.
+4. The thread pool size is capped at `min(max_workers, actual_partition_count)` — no wasted threads.
+
+```python
+# parallel.py — page-parallel discovery + fan-out
+first_spec = asset.build_request(context, checkpoint=None)
+first_data = client.request(first_spec)
+first_df, first_state = asset.parse_response(first_data)
+
+total_pages = first_state.total_pages  # or computed from total_records
+pool_size = min(asset.max_workers, total_pages - 1)
+
+# Partition pages 2..N across workers
+remaining = list(range(2, total_pages + 1))
+chunk_size = max(1, math.ceil(len(remaining) / asset.max_workers))
+partitions = [remaining[i:i + chunk_size] for i in range(0, len(remaining), chunk_size)]
+```
+
+**Example — SonarQube projects:**
+
+```python
+class SonarQubeProjects(SonarQubeAsset):
+    name = "sonarqube_projects"
+    parallel_mode = ParallelMode.PAGE_PARALLEL
+    max_workers = 4
+    rate_limit_per_second = 10
+```
+
+SonarQube returns `paging.total` on every response, so the total pages are known after the first request. With `max_workers=4`, pages are split into 4 roughly equal batches and fetched concurrently.
+
+**Checkpoint behavior:** each worker saves its own checkpoint keyed by `worker_id` (e.g., `"pages_2_25"`). The checkpoint value is `{"last_page": N}`. On retry, workers whose checkpoint has `status="completed"` are skipped entirely.
+
+**Use when:** the API returns a total count or total pages on the first response.
+
+## Entity-parallel
+
+For child resources — issues per project, commits per repo, PRs per branch — where you need to fetch sub-resources for each row of a parent asset's table.
+
+**How it works:**
+
+1. Parent entity primary keys are loaded directly from the parent asset's table in the database.
+2. The key list is partitioned across `max_workers` threads.
+3. Each worker iterates its assigned entities. For each entity, it calls `_fetch_pages()` with `build_entity_request(entity_key, context, checkpoint)` as the request builder.
+4. An entity is only marked complete **after all its pages have been successfully written**. If a worker dies mid-entity, the next run resumes from the exact page within that entity.
+
+```python
+# runner.py — loading entity keys from parent asset's table
+def _load_entity_keys(engine, asset):
+    parent_cls = get(asset.parent_asset_name)
+    parent = parent_cls()
+    pk_cols = ", ".join(f'"{c}"' for c in parent.primary_key)
+    query = f'SELECT {pk_cols} FROM "{parent.target_schema}"."{parent.target_table}"'
+    df = pd.read_sql(query, engine)
+    return df[parent.primary_key[0]].tolist()
+```
+
+**Example — Jira issues per project:**
+
+```python
+class JiraIssues(JiraAsset):
+    name = "jira_issues"
+    parallel_mode = ParallelMode.ENTITY_PARALLEL
+    parent_asset_name = "jira_projects"
+    max_workers = 6
+
+    def build_entity_request(self, project_key, context, checkpoint=None):
+        page = (checkpoint or {}).get("next_page", 0)
+        return RequestSpec(
+            url=self.get_jira_url("/rest/api/3/search"),
+            params={"jql": f"project={project_key}", "startAt": page * 50, "maxResults": 50},
+        )
+```
+
+**Checkpoint behavior:** each worker saves a unified checkpoint containing:
+
+```python
+{
+    "completed_entities": ["PROJECT_A", "PROJECT_B"],  # fully fetched
+    "current_entity": "PROJECT_C",                     # in progress
+    "pagination_state": {"next_page": 3}               # where within current entity
+}
+```
+
+This enables exact mid-entity resume — the next worker knows both which entities are done and where within the current entity to continue.
+
+**Use when:** you need to fetch sub-resources for each parent entity. Requires `parent_asset_name` referencing an already-loaded asset.
+
+## Shared infrastructure
+
+All three modes share the same infrastructure. The critical property is that everything that controls outbound API behavior is **one instance shared across all threads**.
+
+```
+┌─────────────────────────────────────────┐
+│          Shared Rate Limiter             │
+│  (e.g., 10 calls/sec for the asset)     │
+│                                          │
+│    ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ │
+│    │ W-0  │ │ W-1  │ │ W-2  │ │ W-3  │ │
+│    │Thread│ │Thread│ │Thread│ │Thread│ │
+│    └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ │
+│       │        │        │        │      │
+│       └────────┴────┬───┴────────┘      │
+│                     │                    │
+│              limiter.acquire()           │
+│         (blocks until token available)   │
+└─────────────────────────────────────────┘
+
+IMPORTANT: 4 workers at 10/sec = still 10 calls/sec TOTAL, not 40.
+The limiter is shared. Workers wait their turn.
+```
+
+<Warning>
+  Adding more workers does **not** increase the effective API call rate. The rate limiter is shared across all threads. `max_workers=4` with `rate_limit_per_second=10` still produces at most 10 API calls per second total. Workers increase concurrency (hiding latency), not throughput.
+</Warning>
+
+### Rate limiter
+
+`RateLimiter` is a thread-safe sliding-window counter. It tracks timestamps of recent API calls within a 1-second window. If the window is full (`>= rate` calls in the last second), `acquire()` blocks the calling thread until the oldest call exits the window.
+
+```python
+# extract/rate_limiter.py
+class RateLimiter:
+    def acquire(self) -> None:
+        """Block until a call slot is available within the rate window."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                cutoff = now - self._window
+                while self._timestamps and self._timestamps[0] <= cutoff:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._max_calls:
+                    self._timestamps.append(now)
+                    return
+                wait = self._timestamps[0] + self._window - now
+            time.sleep(max(wait, 0.001))
+```
+
+The limiter also supports `pause_for(seconds)` for APIs that return a `Retry-After` header.
+
+### Token manager
+
+A single token manager instance is created per run and shared across all worker threads. Token refresh is thread-safe — all workers get the same valid token without each triggering its own refresh.
+
+### Error handling
+
+- **`SkippedRequestError`** (e.g., HTTP 404): the entity is skipped and extraction continues. The error is logged at WARNING level. The run is not failed.
+- **Non-JSON responses** (e.g., HTML error pages from proxies): caught and wrapped with the URL, HTTP status code, and a body preview for diagnostics.
+- **Worker failure**: if any worker thread raises an unhandled exception, `_run_workers()` calls `pool.shutdown(wait=True, cancel_futures=True)` to cancel remaining workers and re-raises the exception on the main thread.

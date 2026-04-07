@@ -1,0 +1,483 @@
+---
+title: "APIAsset (custom)"
+description: "Build a fully custom REST API asset with build_request() and parse_response()."
+---
+
+`APIAsset` gives you full control over how requests are built and responses are parsed. Use it when `RestAsset`'s declarative model doesn't fit your API.
+
+## When to use APIAsset vs RestAsset
+
+| Use APIAsset when... | Use RestAsset instead when... |
+|---|---|
+| API needs custom request logic (multi-org iteration, JQL construction) | Standard GET endpoint returns a JSON records array |
+| Pagination needs keyset or custom sort parameters | Pagination is page number, offset, or cursor |
+| Response parsing needs nested extraction or type conversion | Field mapping is straightforward renames |
+| Incremental mode requires sort-by-update or `should_stop()` | No incremental date filter needed |
+
+---
+
+## Key attribute groups
+
+Every `APIAsset` subclass sets attributes across five groups:
+
+| Group | Attributes |
+|---|---|
+| **Identity** | `name`, `description`, `source_name` — what the asset is, used in logs, CLI, and the registry |
+| **Target** | `target_schema`, `target_table`, `columns`, `primary_key`, `indexes` — where data lands in Postgres |
+| **Extraction** | `token_manager_class`, `base_url`, `rate_limit_per_second`, `pagination_config`, `parallel_mode`, `max_workers` — how to get the data |
+| **Loading** | `load_strategy`, `default_run_mode`, `date_column`, `api_date_param` — how to persist data |
+| **Run resilience** | `stale_heartbeat_minutes` (default 20 min), `max_run_hours` (default 5 h) — when a run is considered abandoned |
+
+---
+
+## Complete PagerDuty example
+
+The following class is a fully annotated example. Every attribute is explained inline.
+
+```python pagerduty/incidents.py
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import pandas as pd
+
+from data_assets.core.api_asset import APIAsset
+from data_assets.core.column import Column, Index
+from data_assets.core.enums import LoadStrategy, ParallelMode, RunMode
+from data_assets.core.registry import register
+from data_assets.core.run_context import RunContext
+from data_assets.core.types import PaginationConfig, PaginationState, RequestSpec
+from data_assets.extract.token_manager import PagerDutyTokenManager
+
+
+@register
+class PagerDutyIncidents(APIAsset):
+    """PagerDuty incidents — all incidents across services."""
+
+    # ---------------------------------------------------------------
+    # Identity
+    # ---------------------------------------------------------------
+    name = "pagerduty_incidents"
+    # Globally unique. Used in CLI (`run --asset pagerduty_incidents`),
+    # logs, and registry. Convention: {source}_{entity} in snake_case.
+
+    description = "All incidents from PagerDuty, updated incrementally"
+    source_name = "pagerduty"
+
+    # ---------------------------------------------------------------
+    # Target table in Postgres
+    # ---------------------------------------------------------------
+    target_schema = "raw"          # "raw" for API-sourced data
+    target_table = "pagerduty_incidents"
+
+    # ---------------------------------------------------------------
+    # Authentication
+    # ---------------------------------------------------------------
+    token_manager_class = PagerDutyTokenManager
+    # Points to the token manager class (not an instance).
+    # The framework instantiates it once per run.
+
+    # ---------------------------------------------------------------
+    # Base URL — always empty at class level
+    # ---------------------------------------------------------------
+    base_url = ""
+    # Read the actual URL from an env var inside build_request().
+    # This lets the same code work against staging and production.
+
+    # ---------------------------------------------------------------
+    # Rate limiting
+    # ---------------------------------------------------------------
+    rate_limit_per_second = 6.0
+    # Shared across all workers. If max_workers=4 and rate_limit=6,
+    # the total rate is still 6/sec, not 24/sec.
+
+    # ---------------------------------------------------------------
+    # Pagination
+    # ---------------------------------------------------------------
+    pagination_config = PaginationConfig(
+        strategy="offset",
+        page_size=100,
+    )
+    # strategy options:
+    #   "page_number" — API uses ?page=N&per_page=M
+    #   "offset"      — API uses ?offset=N&limit=M
+    #   "cursor"      — API returns a cursor for the next page
+    #   "none"        — single request, no pagination
+
+    # ---------------------------------------------------------------
+    # Parallel extraction
+    # ---------------------------------------------------------------
+    parallel_mode = ParallelMode.NONE
+    # NONE: sequential, one page at a time
+    # PAGE_PARALLEL: fetch pages concurrently (requires total_path)
+    # ENTITY_PARALLEL: fan out one request per parent entity
+
+    max_workers = 1
+    entity_key_column = None
+
+    # ---------------------------------------------------------------
+    # Load strategy
+    # ---------------------------------------------------------------
+    load_strategy = LoadStrategy.UPSERT
+    # FULL_REPLACE: truncate and reload every run
+    # UPSERT: INSERT ... ON CONFLICT (primary_key) DO UPDATE
+    # APPEND: INSERT only, no deduplication
+
+    # ---------------------------------------------------------------
+    # Run mode
+    # ---------------------------------------------------------------
+    default_run_mode = RunMode.FORWARD
+    # FULL: fetch everything from scratch
+    # FORWARD: fetch only data since the last successful run
+    # BACKFILL: fetch historical data before earliest coverage
+
+    # ---------------------------------------------------------------
+    # Columns
+    # ---------------------------------------------------------------
+    columns = [
+        Column("id", "TEXT", nullable=False),
+        Column("incident_number", "INTEGER", nullable=False),
+        Column("title", "TEXT"),
+        Column("status", "TEXT"),
+        Column("urgency", "TEXT"),
+        Column("priority_name", "TEXT", nullable=True),
+        Column("service_id", "TEXT"),
+        Column("service_name", "TEXT"),
+        Column("created_at", "TIMESTAMPTZ"),
+        Column("updated_at", "TIMESTAMPTZ"),
+        Column("resolved_at", "TIMESTAMPTZ", nullable=True),
+        Column("html_url", "TEXT"),
+        Column("raw_json", "JSONB", nullable=True),
+    ]
+    # Column(name, pg_type, nullable=True, default=None)
+    # Common pg_types: TEXT, INTEGER, FLOAT, BOOLEAN, TIMESTAMPTZ, JSONB, DATE
+
+    # ---------------------------------------------------------------
+    # Primary key
+    # ---------------------------------------------------------------
+    primary_key = ["id"]
+    # Used by UPSERT for ON CONFLICT resolution.
+    # Composite: primary_key = ["project_key", "incident_id"]
+
+    # ---------------------------------------------------------------
+    # Indexes
+    # ---------------------------------------------------------------
+    indexes = [
+        Index(columns=("status",)),
+        Index(columns=("updated_at",)),
+        Index(columns=("service_name",)),
+    ]
+    # Every asset must declare at least one Index.
+    # Design indexes based on how analysts will query the data.
+
+    # ---------------------------------------------------------------
+    # Incremental support
+    # ---------------------------------------------------------------
+    date_column = "updated_at"
+    # The framework stores MAX(date_column) after each successful run.
+    # On the next FORWARD run, context.start_date is set to that value.
+
+    api_date_param = "since"
+    # Informational. The actual parameter construction happens in
+    # build_request() where you use context.start_date.
+```
+
+---
+
+## build_request()
+
+Called by the extraction framework to construct the HTTP request for the current page.
+
+**Contract:**
+
+```python
+def build_request(
+    self,
+    context: RunContext,
+    checkpoint: dict | None = None,
+) -> RequestSpec:
+```
+
+**Arguments:**
+
+- `context` — Immutable `RunContext` dataclass with:
+  - `run_id` (UUID) — unique run identifier
+  - `mode` (RunMode) — FULL, FORWARD, or BACKFILL
+  - `asset_name` (str) — this asset's name
+  - `start_date` (datetime | None) — lower bound for incremental extraction; `None` in FULL mode
+  - `end_date` (datetime | None) — upper bound (usually now)
+  - `params` (dict) — extra parameters passed at invocation time
+
+- `checkpoint` — Dict with saved pagination state from the last `parse_response()` call, or `None` on the first call. Common keys: `"next_page"`, `"next_offset"`, `"cursor"`.
+
+**Returns:** `RequestSpec` with `method`, `url`, `params`, `headers`, and `body`. Auth headers are added automatically by the framework from your token manager.
+
+**PagerDuty example:**
+
+```python
+def build_request(
+    self,
+    context: RunContext,
+    checkpoint: dict | None = None,
+) -> RequestSpec:
+    # Read base URL from env var at runtime — never hard-code at class level.
+    base = os.environ.get("PAGERDUTY_URL", "https://api.pagerduty.com")
+
+    # Guard against checkpoint being None (first page) vs. empty dict.
+    offset = checkpoint.get("next_offset", 0) if checkpoint else 0
+
+    params: dict[str, Any] = {
+        "limit": self.pagination_config.page_size,
+        "offset": offset,
+        "sort_by": "created_at:desc",
+    }
+
+    # Add date filter for incremental (FORWARD) runs.
+    if context.start_date:
+        params["since"] = context.start_date.isoformat()
+
+    return RequestSpec(
+        method="GET",
+        url=f"{base}/incidents",
+        params=params,
+        headers={"Accept": "application/json"},
+    )
+```
+
+<Note>
+Never set `base_url = os.environ.get("PAGERDUTY_URL")` at class definition time. Environment variables are read at import time, before they are set. Always read them inside `build_request()` at runtime.
+</Note>
+
+---
+
+## parse_response()
+
+Called with the raw JSON response from the API. Extract records into a DataFrame and report pagination state.
+
+**Contract:**
+
+```python
+def parse_response(
+    self,
+    response: dict | list,
+) -> tuple[pd.DataFrame, PaginationState]:
+```
+
+**Returns:** A tuple of:
+1. `pd.DataFrame` — column names must exactly match the `name` fields in your `columns` list
+2. `PaginationState` with `has_more`, `cursor`, `next_offset`, `next_page`, `total_pages`, `total_records`
+
+**PagerDuty example:**
+
+```python
+def parse_response(
+    self,
+    response: dict[str, Any],
+) -> tuple[pd.DataFrame, PaginationState]:
+    # 1. Extract the list of records.
+    incidents = response.get("incidents", [])
+
+    # 2. Flatten each record into a dict matching column names.
+    records: list[dict[str, Any]] = []
+    for inc in incidents:
+        service = inc.get("service") or {}
+        priority = inc.get("priority") or {}
+
+        records.append({
+            "id":              inc.get("id"),
+            "incident_number": inc.get("incident_number"),
+            "title":           inc.get("title"),
+            "status":          inc.get("status"),
+            "urgency":         inc.get("urgency"),
+            "priority_name":   priority.get("summary"),
+            "service_id":      service.get("id"),
+            "service_name":    service.get("summary"),
+            "created_at":      inc.get("created_at"),
+            "updated_at":      inc.get("last_status_change_at"),
+            "resolved_at":     inc.get("resolved_at"),
+            "html_url":        inc.get("html_url"),
+            "raw_json":        inc,  # store full JSON as JSONB for debugging
+        })
+
+    # 3. Build the DataFrame — always specify columns= for consistent ordering
+    #    and to ensure all columns exist even when the API returns zero records.
+    df = pd.DataFrame(records, columns=[c.name for c in self.columns])
+
+    # 4. Determine if there are more pages.
+    has_more = response.get("more", False)
+    offset = response.get("offset", 0)
+    limit = response.get("limit", 100)
+
+    return df, PaginationState(
+        has_more=has_more,
+        next_offset=offset + limit,
+        total_records=response.get("total"),
+    )
+```
+
+<Tip>
+Store full API responses as JSONB (`"raw_json": inc`) for fields you might want to extract later, without re-fetching historical data.
+</Tip>
+
+---
+
+## build_entity_request() for ENTITY_PARALLEL
+
+Use `ENTITY_PARALLEL` when fetching child data scoped to a parent entity: issues per project, commits per repo, alerts per service.
+
+**How it works:**
+1. The framework reads all primary-key values from the parent asset's table.
+2. For each value, it calls `build_entity_request(entity_key=...)`.
+3. Pages are fetched and parsed in parallel across `max_workers` threads.
+
+**Contract:**
+
+```python
+def build_entity_request(
+    self,
+    entity_key: Any,        # one value from the parent's primary key column
+    context: RunContext,
+    checkpoint: dict | None = None,
+) -> RequestSpec:
+```
+
+**Jira issues per project example:**
+
+```python
+# On the asset class:
+parallel_mode = ParallelMode.ENTITY_PARALLEL
+max_workers = 3
+parent_asset_name = "jira_projects"
+# The framework reads all "key" values from the jira_projects table.
+
+def build_entity_request(
+    self,
+    entity_key: str,              # e.g., "PROJ-A", "PROJ-B"
+    context: RunContext,
+    checkpoint: dict | None = None,
+) -> RequestSpec:
+    start_date_iso = None
+    if context.start_date:
+        start_date_iso = context.start_date.isoformat()
+
+    jql = self._build_jql(
+        project_key=entity_key,
+        start_date=start_date_iso,
+    )
+
+    start_at = checkpoint.get("next_offset", 0) if checkpoint else 0
+
+    base = os.environ.get("JIRA_URL", self.base_url)
+    return RequestSpec(
+        method="GET",
+        url=f"{base}/rest/api/3/search",
+        params={
+            "jql": jql,
+            "maxResults": 100,
+            "startAt": start_at,
+            "fields": "summary,status,priority,issuetype,assignee,"
+                      "reporter,created,updated,resolutiondate,labels",
+        },
+    )
+```
+
+<Note>
+Entity-parallel assets do not need to implement `build_request()`. The framework provides a default that delegates to `build_entity_request()`. The `parse_response()` method is shared — it does not know or care which entity it is parsing.
+</Note>
+
+---
+
+## Wiring it up
+
+<Steps>
+  <Step title="Create the directory structure">
+    ```
+    src/data_assets/assets/pagerduty/
+        __init__.py
+        incidents.py
+    ```
+  </Step>
+
+  <Step title="Write __init__.py to import the asset class">
+    ```python assets/pagerduty/__init__.py
+    """PagerDuty assets: incidents."""
+    from data_assets.assets.pagerduty.incidents import PagerDutyIncidents
+    ```
+
+    This import is essential. The framework discovers assets by walking all subpackages under `data_assets.assets`. Importing a module that contains a `@register`-decorated class triggers registration.
+  </Step>
+
+  <Step title="Add the package import to assets/__init__.py">
+    ```python assets/__init__.py
+    """Concrete asset definitions for all supported data sources."""
+
+    import data_assets.assets.sonarqube   # noqa: F401
+    import data_assets.assets.servicenow  # noqa: F401
+    import data_assets.assets.github      # noqa: F401
+    import data_assets.assets.jira        # noqa: F401
+    import data_assets.assets.transforms  # noqa: F401
+    import data_assets.assets.pagerduty   # noqa: F401  # <-- ADD THIS
+    ```
+  </Step>
+
+  <Step title="Add the token manager">
+    Add your `PagerDutyTokenManager` class to `src/data_assets/extract/token_manager.py`. See [Token managers](/extending/token-managers).
+  </Step>
+</Steps>
+
+---
+
+## The extract() hook (SDK client pattern)
+
+For APIs with an official Python SDK (e.g., pysnc for ServiceNow), you can bypass the APIClient/httpx pipeline entirely by overriding `extract()` on your asset class.
+
+```python
+def extract(
+    self, engine: Engine, temp_table: str, context: RunContext,
+) -> int | None:
+    """Override to bypass the standard API pipeline.
+
+    Return the number of rows extracted. Return None to fall back
+    to the default extraction pipeline.
+    """
+```
+
+The runner checks whether the asset class overrides `extract()`. If it does, it calls it directly instead of going through `build_request()` → `APIClient` → `parse_response()`. Your method is responsible for fetching data and writing it to the temp table via `write_to_temp()`.
+
+**ServiceNow example** (all 14 ServiceNow table assets use this pattern):
+
+```python
+# assets/servicenow/base.py (simplified)
+class ServiceNowTableAsset(APIAsset):
+    token_manager_class = ServiceNowTokenManager
+
+    def _create_pysnc_client(self):
+        from pysnc import ServiceNowClient
+        token_mgr = self.token_manager_class()
+        return ServiceNowClient(token_mgr.instance, token_mgr.get_pysnc_auth())
+
+    def extract(self, engine, temp_table, context):
+        client = self._create_pysnc_client()
+        gr = client.GlideRecord(self.table_name, batch_size=1000)
+        gr.fields = [c.name for c in self.columns]
+
+        if context.start_date:
+            gr.add_query("sys_updated_on", ">=",
+                          context.start_date.strftime("%Y-%m-%d %H:%M:%S"))
+
+        gr.query()
+
+        total_rows = 0
+        batch = []
+        for record in gr:
+            batch.append(record.serialize())
+            if len(batch) >= 1000:
+                df = self._batch_to_df(batch)
+                total_rows += write_to_temp(engine, temp_table, df)
+                batch = []
+        # ... flush remaining batch ...
+        return total_rows
+```
+
+Subclasses of `ServiceNowTableAsset` only set `name`, `target_table`, `table_name`, `columns`, and `indexes` — no `build_request()` or `parse_response()` needed.

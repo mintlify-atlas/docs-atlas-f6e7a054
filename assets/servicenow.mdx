@@ -1,0 +1,150 @@
+---
+title: "ServiceNow assets"
+description: "Extract ITSM, service catalog, CMDB, and user directory data from ServiceNow using pysnc."
+---
+
+FlowKit uses [pysnc](https://github.com/ServiceNow/PySNC) — ServiceNow's official Python client — for all ServiceNow extraction. Authentication is handled by `ServiceNowTokenManager`, which supports either OAuth2 password grant or Basic Auth. The token manager provides credentials to pysnc via its `get_pysnc_auth()` method.
+
+All ServiceNow assets share the `ServiceNowTableAsset` base class. The `extract()` hook on this base class creates a pysnc `GlideRecord`, applies date filters, and iterates results in batches of 1000 — bypassing the httpx API pipeline entirely. Subclasses only need to declare `name`, `target_table`, `table_name`, and `columns`.
+
+## Authentication
+
+<Info>
+  See [Configuration — ServiceNow](/guides/configuration#servicenow) for OAuth2 client setup and credential injection instructions.
+</Info>
+
+| Environment variable | Required | Description |
+|----------------------|----------|-------------|
+| `SERVICENOW_INSTANCE` | Yes | Instance URL (e.g., `https://mycompany.service-now.com`) |
+| `SERVICENOW_USERNAME` | Yes | Service account username |
+| `SERVICENOW_PASSWORD` | Yes | Service account password |
+| `SERVICENOW_CLIENT_ID` | OAuth2 only | OAuth2 client ID from the ServiceNow App Registry |
+| `SERVICENOW_CLIENT_SECRET` | OAuth2 only | OAuth2 client secret |
+
+If `SERVICENOW_CLIENT_ID` and `SERVICENOW_CLIENT_SECRET` are present, FlowKit uses OAuth2 password grant. Otherwise it falls back to Basic Auth.
+
+---
+
+## ITSM tables
+
+| Asset | Table | Load | SN table | API endpoint |
+|-------|-------|------|----------|--------------|
+| `servicenow_incidents` | `raw.servicenow_incidents` | UPSERT | `incident` | `/api/now/table/incident` |
+| `servicenow_changes` | `raw.servicenow_changes` | UPSERT | `change_request` | `/api/now/table/change_request` |
+| `servicenow_problems` | `raw.servicenow_problems` | UPSERT | `problem` | `/api/now/table/problem` |
+| `servicenow_change_tasks` | `raw.servicenow_change_tasks` | UPSERT | `change_task` | `/api/now/table/change_task` |
+
+**servicenow_incidents** columns: `sys_id`, `number`, `short_description`, `description`, `state`, `priority`, `severity`, `category`, `assigned_to`, `assignment_group`, `opened_at`, `closed_at`, `sys_updated_on`
+
+**servicenow_changes** columns: `sys_id`, `number`, `short_description`, `description`, `state`, `type`, `priority`, `risk`, `category`, `assigned_to`, `assignment_group`, `opened_at`, `closed_at`, `start_date`, `end_date`, `sys_updated_on`
+
+**servicenow_change_tasks** columns: `sys_id`, `number`, `short_description`, `state`, `priority`, `change_request`, `assigned_to`, `assignment_group`, `planned_start_date`, `planned_end_date`, `sys_updated_on`
+
+**servicenow_problems** columns: `sys_id`, `number`, `short_description`, `state`, `priority`, `category`, `assigned_to`, `assignment_group`, `opened_at`, `closed_at`, `sys_updated_on`
+
+---
+
+## Service catalog
+
+| Asset | Table | Load | SN table | API endpoint |
+|-------|-------|------|----------|--------------|
+| `servicenow_catalog_requests` | `raw.servicenow_catalog_requests` | UPSERT | `sc_request` | `/api/now/table/sc_request` |
+| `servicenow_catalog_items` | `raw.servicenow_catalog_items` | UPSERT | `sc_req_item` | `/api/now/table/sc_req_item` |
+
+**servicenow_catalog_requests** columns: `sys_id`, `number`, `short_description`, `request_state`, `requested_for`, `opened_at`, `closed_at`, `sys_updated_on`
+
+**servicenow_catalog_items** columns: `sys_id`, `number`, `short_description`, `request`, `cat_item`, `state`, `quantity`, `price`, `stage`, `opened_at`, `closed_at`, `sys_updated_on`
+
+---
+
+## User directory
+
+| Asset | Table | Load | SN table | API endpoint |
+|-------|-------|------|----------|--------------|
+| `servicenow_users` | `raw.servicenow_users` | UPSERT | `sys_user` | `/api/now/table/sys_user` |
+| `servicenow_user_groups` | `raw.servicenow_user_groups` | UPSERT | `sys_user_group` | `/api/now/table/sys_user_group` |
+| `servicenow_locations` | `raw.servicenow_locations` | UPSERT | `cmn_location` | `/api/now/table/cmn_location` |
+| `servicenow_departments` | `raw.servicenow_departments` | UPSERT | `cmn_department` | `/api/now/table/cmn_department` |
+
+**servicenow_users** columns: `sys_id`, `user_name`, `name`, `email`, `title`, `department`, `manager`, `active`, `locked_out`, `last_login_time`, `sys_updated_on`
+
+**servicenow_user_groups** columns: `sys_id`, `name`, `description`, `manager`, `email`, `active`, `type`, `sys_updated_on`
+
+**servicenow_locations** columns: `sys_id`, `name`, `city`, `state`, `country`, `latitude`, `longitude`, `parent`, `sys_updated_on`
+
+**servicenow_departments** columns: `sys_id`, `name`, `dept_head`, `description`, `parent`, `primary_contact`, `company`, `sys_updated_on`
+
+---
+
+## CMDB and hardware
+
+| Asset | Table | Load | SN table | API endpoint |
+|-------|-------|------|----------|--------------|
+| `servicenow_cmdb_cis` | `raw.servicenow_cmdb_cis` | UPSERT | `cmdb_ci` | `/api/now/table/cmdb_ci` |
+| `servicenow_hardware_assets` | `raw.servicenow_hardware_assets` | UPSERT | `alm_hardware` | `/api/now/table/alm_hardware` |
+
+**servicenow_cmdb_cis** columns: `sys_id`, `name`, `sys_class_name`, `category`, `subcategory`, `operational_status`, `asset_tag`, `serial_number`, `assigned_to`, `support_group`, `company`, `location`, `sys_updated_on`
+
+**servicenow_hardware_assets** columns: `sys_id`, `display_name`, `asset_tag`, `serial_number`, `model`, `model_category`, `assigned_to`, `location`, `install_status`, `substatus`, `ci`, `sys_updated_on`
+
+---
+
+## Reference tables
+
+| Asset | Table | Load | SN table | API endpoint |
+|-------|-------|------|----------|--------------|
+| `servicenow_choices` | `raw.servicenow_choices` | FULL_REPLACE | `sys_choice` | `/api/now/table/sys_choice` |
+
+**servicenow_choices** is the dropdown decode table for all ServiceNow fields. It maps raw coded values (e.g., `incident.state = "1"`) to human-readable labels (e.g., `"New"`). Join to this table on `name` (table name) + `element` (field name) + `value` to decode any coded field.
+
+Columns: `sys_id`, `name`, `element`, `value`, `label`, `language`, `inactive`, `sys_updated_on`
+
+Unlike all other ServiceNow assets, `servicenow_choices` uses `FULL_REPLACE` with `RunMode.FULL`. The choices table has no reliable `sys_updated_on` watermark for incremental sync — choices can be reactivated, relabeled, or added in bulk without predictable update timestamps.
+
+```python
+run_asset("servicenow_choices", run_mode="full")
+```
+
+---
+
+## Key design choices
+
+<AccordionGroup>
+  <Accordion title="Keyset pagination">
+    Offset pagination on large ServiceNow tables is unreliable. Records inserted or updated during extraction cause rows to be skipped or duplicated as pages shift. FlowKit uses keyset pagination — sorting by `sys_updated_on, sys_id` and filtering from the last-seen record — which eliminates drift regardless of concurrent writes to the table.
+  </Accordion>
+
+  <Accordion title="Why sequential extraction">
+    Keyset pagination is inherently sequential. Each page's filter condition depends on the last `sys_updated_on` and `sys_id` values from the previous page. Parallelism is not possible without losing the keyset guarantee.
+  </Accordion>
+
+  <Accordion title="Why UPSERT">
+    In `FORWARD` mode, the extraction filters by `sys_updated_on >= last_watermark`. A record updated after the previous run appears again in the next run. Upserting by `sys_id` ensures the row is refreshed rather than duplicated.
+  </Accordion>
+
+  <Accordion title="Reference fields">
+    With `sysparm_exclude_reference_link=true`, reference fields like `assigned_to` return the raw `sys_id` string instead of a verbose JSON object with embedded display values and links. This keeps the schema flat and predictable. To get human-readable values, join to `raw.servicenow_users`, `raw.servicenow_user_groups`, or `raw.servicenow_locations` by `sys_id`.
+  </Accordion>
+
+  <Accordion title="Missing column detection">
+    If the ServiceNow instance does not return a declared column — for example, if a field is deprecated or blocked by an ACL — the framework logs a `WARNING` listing the missing column names. Extraction continues, and those columns are loaded as `NULL`. This prevents hard failures from instance-specific field availability differences.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Example
+
+```python
+from data_assets import run_asset
+
+# ITSM — incremental by default
+run_asset("servicenow_incidents", run_mode="forward")
+run_asset("servicenow_changes", run_mode="forward")
+
+# User directory — incremental
+run_asset("servicenow_users", run_mode="forward")
+
+# Reference table — always full
+run_asset("servicenow_choices", run_mode="full")
+```

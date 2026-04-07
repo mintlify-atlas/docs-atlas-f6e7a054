@@ -1,0 +1,234 @@
+---
+title: "run_asset()"
+description: "The primary entry point for executing a FlowKit ETL run."
+---
+
+`run_asset()` is the single public function you call to run any registered asset. It handles the full ETL lifecycle: acquiring a distributed lock, extracting data via API or SQL transform, applying transforms and validation, promoting to the target table, and recording run history.
+
+```python
+from data_assets import run_asset
+```
+
+## Signature
+
+```python
+def run_asset(
+    asset_name: str,
+    run_mode: str = "full",
+    secrets: dict[str, str] | None = None,
+    partition_key: str = "",
+    **overrides,
+) -> dict:
+```
+
+## Parameters
+
+<ParamField path="asset_name" type="string" required>
+  Name matching a registered asset class. Must correspond to a class decorated with `@register` whose `name` attribute equals this string.
+</ParamField>
+
+<ParamField path="run_mode" type="string" default="full">
+  Extraction mode. One of `"full"`, `"forward"`, `"backfill"`, or `"transform"`. Defaults to the asset's `default_run_mode` if not specified at call time.
+
+  | Value | Behavior |
+  |---|---|
+  | `"full"` | Extracts all data; replaces or upserts the entire table |
+  | `"forward"` | Extracts from the last forward watermark to now |
+  | `"backfill"` | Extracts from the start of history up to the backward watermark |
+  | `"transform"` | Runs the SQL transform on existing Postgres tables (TransformAsset only) |
+</ParamField>
+
+<ParamField path="secrets" type="dict[str, str]">
+  Credentials to inject as environment variables for this run. Keys are env var names; values are the secret strings.
+
+  Secrets are injected before token managers initialize and removed from `os.environ` in the `finally` block, so they do not leak to other tasks in the same worker process.
+
+  This is the primary pattern for Airflow DAGs to pass secrets from Connections, Variables, or secret backends.
+</ParamField>
+
+<ParamField path="partition_key" type="string" default='""'>
+  Partition identifier for multi-org or multi-tenant runs. When set, the distributed lock, coverage watermarks, and checkpoints are scoped to `(asset_name, partition_key)`, allowing different partitions to run concurrently without interference.
+
+  The target table is shared — UPSERT with partition-scoped primary keys handles data segregation correctly. Default `""` means no partitioning (single-tenant behavior).
+</ParamField>
+
+### Runtime overrides (`**overrides`)
+
+These keyword arguments override asset-level configuration for a single run.
+
+<ParamField path="rate_limit_per_second" type="float">
+  Overrides the asset's `rate_limit_per_second` for this run.
+</ParamField>
+
+<ParamField path="max_workers" type="integer">
+  Overrides the asset's `max_workers` for this run.
+</ParamField>
+
+<ParamField path="request_timeout" type="float">
+  Overrides the asset's `request_timeout` (seconds) for this run.
+</ParamField>
+
+<ParamField path="max_retries" type="integer">
+  Overrides the asset's `max_retries` for this run.
+</ParamField>
+
+<ParamField path="start_date" type="datetime">
+  Overrides the computed start of the date window. Must be used together with `end_date`.
+</ParamField>
+
+<ParamField path="end_date" type="datetime">
+  Overrides the computed end of the date window. Must be used together with `start_date`.
+</ParamField>
+
+<ParamField path="airflow_run_id" type="string">
+  Links this run to an Airflow `run_id` in the run history table. Useful for cross-referencing FlowKit runs with the Airflow task log.
+</ParamField>
+
+<ParamField path="dry_run" type="boolean" default="false">
+  When `True`, extraction, transform, and validation all run normally, but the promotion step is skipped. The temp table is cleaned up and coverage watermarks are not updated. Returns `status: "dry_run"` in the result dict.
+</ParamField>
+
+## Return value
+
+Returns a `dict` with run metrics on success. Raises an exception on failure (the distributed lock is released and the temp table is cleaned up before the exception propagates).
+
+<ResponseField name="run_id" type="string" required>
+  UUIDv7 identifier for this run. Used to correlate entries in the run history table.
+</ResponseField>
+
+<ResponseField name="asset_name" type="string" required>
+  The asset name passed to the function.
+</ResponseField>
+
+<ResponseField name="partition_key" type="string" required>
+  The partition key used for this run (`""` for unpartitioned runs).
+</ResponseField>
+
+<ResponseField name="rows_extracted" type="integer" required>
+  Number of rows written to the temp table during extraction.
+</ResponseField>
+
+<ResponseField name="rows_loaded" type="integer" required>
+  Number of rows promoted to the target table. `0` for dry runs.
+</ResponseField>
+
+<ResponseField name="duration_seconds" type="float" required>
+  Total wall-clock duration of the run from entry to return, rounded to 2 decimal places.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  `"success"` for a completed run, `"dry_run"` when `dry_run=True` was passed.
+</ResponseField>
+
+<ResponseField name="metadata" type="object" required>
+  Additional metrics collected during the run.
+
+  <Expandable title="metadata properties">
+    <ResponseField name="extraction_seconds" type="float">
+      Wall-clock time spent in the extraction phase.
+    </ResponseField>
+    <ResponseField name="promotion_seconds" type="float">
+      Wall-clock time spent in the promotion phase.
+    </ResponseField>
+    <ResponseField name="warnings" type="string[]">
+      Non-blocking validation warnings logged during the run.
+    </ResponseField>
+    <ResponseField name="api_calls" type="integer">
+      Total HTTP requests made during extraction. Present for APIAsset and RestAsset runs; absent for TransformAsset runs.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Examples
+
+<CodeGroup>
+
+```python Basic usage
+from data_assets import run_asset
+
+result = run_asset("github_repos")
+print(result["rows_loaded"])  # e.g. 1432
+```
+
+```python Forward incremental run
+from data_assets import run_asset
+
+result = run_asset("jira_issues", run_mode="forward")
+print(result["status"])  # "success"
+```
+
+```python Dry run
+from data_assets import run_asset
+
+result = run_asset("sonarqube_projects", dry_run=True)
+# Extraction and validation ran, but nothing was promoted
+assert result["status"] == "dry_run"
+assert result["rows_loaded"] == 0
+```
+
+```python With secrets injection (Airflow pattern)
+from airflow.hooks.base import BaseHook
+from data_assets import run_asset
+
+def run_github(**kwargs):
+    conn = BaseHook.get_connection("github_app")
+    run_asset(
+        "github_repos",
+        run_mode="full",
+        secrets={
+            "GITHUB_APP_ID": conn.login,
+            "GITHUB_PRIVATE_KEY": conn.password,
+            "GITHUB_INSTALLATION_ID": conn.extra_dejson["installation_id"],
+        },
+        airflow_run_id=kwargs["run_id"],
+    )
+```
+
+```python Multi-org with partition_key
+from airflow.hooks.base import BaseHook
+from data_assets import run_asset
+
+def run_for_org(org_config: dict, **kwargs):
+    conn = BaseHook.get_connection("github_app")
+    run_asset(
+        "github_repos",
+        run_mode="full",
+        partition_key=org_config["org"],
+        secrets={
+            "GITHUB_APP_ID": conn.login,
+            "GITHUB_PRIVATE_KEY": conn.password,
+            "GITHUB_INSTALLATION_ID": org_config["installation_id"],
+            "GITHUB_ORGS": org_config["org"],
+        },
+        airflow_run_id=kwargs["run_id"],
+    )
+```
+
+```python With overrides
+from data_assets import run_asset
+
+result = run_asset(
+    "servicenow_incidents",
+    run_mode="forward",
+    rate_limit_per_second=5.0,
+    max_workers=4,
+    request_timeout=120.0,
+    max_retries=5,
+)
+```
+
+</CodeGroup>
+
+## Error behavior
+
+`run_asset()` raises the original exception on any failure. Before re-raising, the runner:
+
+1. Records the failure in the run history table with the error message.
+2. Drops the temp table if it was created.
+3. Releases the distributed lock so the next run can proceed.
+
+Callers do not need to clean up state on failure; the runner handles it in the `finally` block.
+
+<Warning>
+  If the process is killed (SIGKILL, OOM) rather than raising a Python exception, the lock heartbeat will stop updating. A subsequent run will take over the abandoned run after `stale_heartbeat_minutes` (default 20) or `max_run_hours` (default 5) — whichever threshold is exceeded first. The temp table from the abandoned run is reused to avoid re-fetching already-written pages.
+</Warning>

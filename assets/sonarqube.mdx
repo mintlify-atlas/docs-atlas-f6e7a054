@@ -1,0 +1,85 @@
+---
+title: "SonarQube assets"
+description: "Extract code quality metrics, issues, and project data from SonarQube."
+---
+
+FlowKit uses a static API token (Bearer) to authenticate all SonarQube requests. The `SonarQubeTokenManager` reads the token from environment and attaches it as an `Authorization: Bearer` header on every request.
+
+## Authentication
+
+<Info>
+  See [Configuration — SonarQube](/guides/configuration#sonarqube) for instructions on generating a user or project token in the SonarQube UI.
+</Info>
+
+| Environment variable | Required | Description |
+|----------------------|----------|-------------|
+| `SONARQUBE_URL` | Yes | Base URL of your SonarQube instance (e.g., `https://sonarqube.example.com`) |
+| `SONARQUBE_TOKEN` | Yes | User or analysis token with Browse permission on all projects |
+
+---
+
+## Assets
+
+| Asset | Table | Load | Parallel | Pagination | API endpoint |
+|-------|-------|------|----------|------------|--------------|
+| `sonarqube_projects` | `raw.sonarqube_projects` | FULL_REPLACE | PAGE_PARALLEL (3 workers) | page_number (`p`, `ps`) | `GET /api/components/search?qualifiers=TRK` |
+| `sonarqube_issues` | `raw.sonarqube_issues` | UPSERT | ENTITY_PARALLEL (3 workers) | page_number (`p`, `ps`) | `GET /api/issues/search` |
+| `sonarqube_measures` | `raw.sonarqube_measures` | FULL_REPLACE | ENTITY_PARALLEL (3 workers) | none (one call per project) | `GET /api/measures/component` |
+
+---
+
+## sonarqube_projects
+
+Lists all projects (`qualifier=TRK`) from the SonarQube instance. Implemented as a `RestAsset` — the simplest declarative pattern in FlowKit. The first response includes `paging.total`, so the framework can calculate the total page count upfront and fan out all pages concurrently with `PAGE_PARALLEL`.
+
+Columns: `key`, `name`, `qualifier`  
+Primary key: `key`
+
+Uses `FULL_REPLACE` because the project catalog is small and changes infrequently. A full replacement is cheaper than tracking additions and deletions.
+
+```python
+run_asset("sonarqube_projects", run_mode="full")
+```
+
+---
+
+## sonarqube_issues
+
+Fetches issues scoped per project using `componentKeys`. The framework loads `key` values from `raw.sonarqube_projects` and dispatches one request stream per project with `ENTITY_PARALLEL` (3 workers).
+
+Columns: `key`, `rule`, `severity`, `component`, `project`, `line`, `message`, `status`, `type`, `creation_date`, `update_date`  
+Primary key: `key`  
+Watermark column: `update_date`
+
+<Note>
+  SonarQube's `createdAfter` parameter only filters by creation date, which misses updates to existing issues (severity changes, resolutions, reopens). FlowKit instead sorts by `UPDATE_DATE` ascending and pages through all results from the watermark. The `paging.total` field in the response means no early-stop logic is needed — pagination exhausts naturally.
+</Note>
+
+Uses `UPSERT` because the same issue key can appear in multiple runs if it was updated between runs. Upsert by `key` prevents duplicates.
+
+```python
+run_asset("sonarqube_issues", run_mode="forward")
+```
+
+---
+
+## sonarqube_measures
+
+Fetches current quality metric values for each project. One API call per project returns all requested metrics. No pagination — the response is a single JSON object.
+
+Columns: `project_key`, `ncloc`, `bugs`, `vulnerabilities`, `code_smells`, `coverage`, `duplicated_lines_density`, `sqale_index`  
+Primary key: `project_key`
+
+The `metricKeys` parameter requests exactly these seven metrics: `ncloc`, `bugs`, `vulnerabilities`, `code_smells`, `coverage`, `duplicated_lines_density`, `sqale_index`. Each measure in the response array is flattened into a single row per project.
+
+Uses `FULL_REPLACE` because measures represent the current state of each project — there is no incremental value in retaining previous snapshots in this table.
+
+```python
+run_asset("sonarqube_measures", run_mode="full")
+```
+
+---
+
+## Shared base class
+
+`sonarqube_issues` and `sonarqube_measures` both extend `SonarQubeAsset` (defined in `assets/sonarqube/helpers.py`), which sets `token_manager_class`, `source_name`, `target_schema`, and `rate_limit_per_second = 5.0`. `sonarqube_projects` uses `RestAsset` directly and sets the same shared config as class attributes.
